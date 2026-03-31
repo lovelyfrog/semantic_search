@@ -1,0 +1,9 @@
+[tasks.fmt-fix]
+install_crate = "rustfmt"
+command = "cargo"
+args = ["fmt", "--all", "--", "--emit", "files"]
+
+[tasks.clippy]
+install_crate = "clippy"
+command = "cargo"
+args = ["clippy", "--all-features", "--", "-D", "warnings"]
