@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ArkTS 验证趋势图</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      padding: 20px;
+      min-height: 100vh;
+    }
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    h1 {
+      color: white;
+      text-align: center;
+      margin-bottom: 30px;
+      font-size: 2.5em;
+      text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 20px;
+      margin-bottom: 30px;
+    }
+    .stat-card {
+      background: white;
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+      transition: transform 0.2s;
+    }
+    .stat-card:hover {
+      transform: translateY(-5px);
+      box-shadow: 0 8px 12px rgba(0,0,0,0.15);
+    }
+    .stat-label {
+      color: #666;
+      font-size: 0.9em;
+      margin-bottom: 5px;
+    }
+    .stat-value {
+      font-size: 2em;
+      font-weight: bold;
+      color: #333;
+    }
+    .stat-trend {
+      font-size: 0.85em;
+      margin-top: 5px;
+    }
+    .trend-up { color: #10b981; }
+    .trend-down { color: #ef4444; }
+    .chart-container {
+      background: white;
+      border-radius: 12px;
+      padding: 30px;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+      margin-bottom: 20px;
+    }
+    .chart-wrapper {
+      position: relative;
+      height: 400px;
+    }
+    .footer {
+      text-align: center;
+      color: white;
+      margin-top: 20px;
+      font-size: 0.9em;
+      opacity: 0.8;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>📊 ArkTS 验证趋势分析</h1>
+    
+    <div style="background: white; border-radius: 12px; padding: 20px; margin-bottom: 30px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+      <label style="font-weight: bold; color: #333; margin-right: 10px;">📁 选择目录:</label>
+      <select id="dirSelector" style="padding: 10px 15px; border-radius: 8px; border: 2px solid #667eea; font-size: 1em; cursor: pointer; background: white; min-width: 300px;">
+        <option value="/Users/million_mo/projects/hmos_projects/hmosworld/" >/Users/million_mo/projects/hmos_projects/hmosworld/</option><option value="./examples" >./examples</option><option value="test/" >test/</option><option value="/Users/million_mo/projects/hmos_projects/hmosworld/HMOSWorld/Application/" selected>/Users/million_mo/projects/hmos_projects/hmosworld/HMOSWorld/Application/</option>
+      </select>
+      <span style="margin-left: 15px; color: #666; font-size: 0.9em;">共 <span id="totalRuns">2</span> 次验证</span>
+    </div>
+    
+    <div class="stats">
+      <div class="stat-card">
+        <div class="stat-label">最新通过率</div>
+        <div class="stat-value" id="statPassRate">93.14%</div>
+        <div class="stat-trend trend-down" id="statPassRateTrend">
+          ↓ 0.00%
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">总文件数</div>
+        <div class="stat-value" id="statTotal">175</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">最新通过数</div>
+        <div class="stat-value" style="color: #10b981;" id="statPassed">163</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">最新失败数</div>
+        <div class="stat-value" style="color: #ef4444;" id="statFailed">12</div>
+      </div>
+    </div>
+
+    <div class="chart-container">
+      <h2 style="margin-bottom: 20px; color: #333;">通过率趋势</h2>
+      <div class="chart-wrapper">
+        <canvas id="passRateChart"></canvas>
+      </div>
+    </div>
+
+    <div class="chart-container">
+      <h2 style="margin-bottom: 20px; color: #333;">文件数量趋势</h2>
+      <div class="chart-wrapper">
+        <canvas id="filesChart"></canvas>
+      </div>
+    </div>
+
+    <div class="footer">
+      最后更新: 2025/10/27 11:46:23
+    </div>
+  </div>
+
+  <script>
+    // 所有目录的数据
+    const allData = {"/Users/million_mo/projects/hmos_projects/hmosworld/":{"labels":["10/17 15:08","10/17 15:34","10/17 15:43","10/17 16:44","10/17 17:07","10/18 11:44","10/18 11:58","10/18 12:59","10/20 11:19","10/20 11:34","10/20 11:56","10/20 12:16","10/20 17:04","10/20 20:07"],"passRateData":[30.86,38.29,40.57,44,46.29,52,54.29,61.71,73.71,76,81.71,86.29,93.71,100],"passedData":[54,67,71,77,81,91,95,108,129,133,143,151,164,175],"failedData":[121,108,104,98,94,84,80,67,46,42,32,24,11,0],"totalData":[175,175,175,175,175,175,175,175,175,175,175,175,175,175],"count":14,"latest":{"timestamp":"2025-10-20T12:07:50.641Z","datetime":"2025/10/20 20:07:50","targetDir":"/Users/million_mo/projects/hmos_projects/hmosworld/","total":175,"passed":175,"failed":0,"passRate":"100.00"},"previous":{"timestamp":"2025-10-20T09:04:25.991Z","datetime":"2025/10/20 17:04:25","targetDir":"/Users/million_mo/projects/hmos_projects/hmosworld/","total":175,"passed":164,"failed":11,"passRate":"93.71"}},"./examples":{"labels":["10/17 15:53","10/17 15:55","10/18 12:34","10/18 12:39","10/18 12:52","10/18 12:53","10/18 12:53","10/18 12:57","10/18 14:57","10/20 10:22","10/20 10:33","10/20 10:39","10/20 10:40","10/20 10:40","10/20 10:45","10/20 11:10","10/20 11:13","10/20 11:16","10/20 11:18","10/20 11:49","10/20 11:49","10/20 11:55","10/20 11:55","10/20 11:56","10/20 12:02","10/20 12:07","10/20 12:07","10/20 14:23","10/20 14:26","10/20 14:28","10/20 14:32","10/20 14:40","10/20 14:43","10/20 14:45","10/20 14:47","10/20 14:48","10/20 14:56","10/20 14:57","10/20 15:11","10/20 15:12","10/20 19:39","10/20 19:41","10/20 19:41","10/20 19:41","10/20 19:55","10/27 11:45","10/27 11:45","10/27 11:45"],"passRateData":[34.78,34.78,43.48,43.48,34.78,34.78,34.78,34.78,34.78,34.78,34.78,37.5,37.5,37.5,37.5,45.83,45.83,45.83,45.83,58.33,58.33,58.33,58.33,58.33,62.5,62.5,62.5,66.67,66.67,66.67,66.67,62.5,66.67,66.67,66.67,66.67,66.67,66.67,66.67,68,76,92,92,92,92,68,68,68],"passedData":[8,8,10,10,8,8,8,8,8,8,8,9,9,9,9,11,11,11,11,14,14,14,14,14,15,15,15,16,16,16,16,15,16,16,16,16,16,16,16,17,19,23,23,23,23,17,17,17],"failedData":[15,15,13,13,15,15,15,15,15,15,15,15,15,15,15,13,13,13,13,10,10,10,10,10,9,9,9,8,8,8,8,9,8,8,8,8,8,8,8,8,6,2,2,2,2,8,8,8],"totalData":[23,23,23,23,23,23,23,23,23,23,23,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,25,25,25,25,25,25,25,25,25],"count":48,"latest":{"timestamp":"2025-10-27T03:45:52.703Z","datetime":"2025/10/27 11:45:52","targetDir":"./examples","total":25,"passed":17,"failed":8,"passRate":"68.00"},"previous":{"timestamp":"2025-10-27T03:45:39.588Z","datetime":"2025/10/27 11:45:39","targetDir":"./examples","total":25,"passed":17,"failed":8,"passRate":"68.00"}},"test/":{"labels":["10/20 12:08","10/20 12:08","10/20 12:15","10/20 12:16"],"passRateData":[74.04,74.04,77.39,77.39],"passedData":[77,77,89,89],"failedData":[27,27,26,26],"totalData":[104,104,115,115],"count":4,"latest":{"timestamp":"2025-10-20T04:16:04.132Z","datetime":"2025/10/20 12:16:04","targetDir":"test/","total":115,"passed":89,"failed":26,"passRate":"77.39"},"previous":{"timestamp":"2025-10-20T04:15:59.242Z","datetime":"2025/10/20 12:15:59","targetDir":"test/","total":115,"passed":89,"failed":26,"passRate":"77.39"}},"/Users/million_mo/projects/hmos_projects/hmosworld/HMOSWorld/Application/":{"labels":["10/27 11:46","10/27 11:46"],"passRateData":[93.14,93.14],"passedData":[163,163],"failedData":[12,12],"totalData":[175,175],"count":2,"latest":{"timestamp":"2025-10-27T03:46:22.345Z","datetime":"2025/10/27 11:46:22","targetDir":"/Users/million_mo/projects/hmos_projects/hmosworld/HMOSWorld/Application/","total":175,"passed":163,"failed":12,"passRate":"93.14"},"previous":{"timestamp":"2025-10-27T03:46:17.147Z","datetime":"2025/10/27 11:46:17","targetDir":"/Users/million_mo/projects/hmos_projects/hmosworld/HMOSWorld/Application/","total":175,"passed":163,"failed":12,"passRate":"93.14"}}};
+    let currentChart1, currentChart2;
+    
+    // 初始化图表
+    function initCharts(dirKey) {
+      const data = allData[dirKey];
+      
+      // 更新统计卡片
+      document.getElementById('statPassRate').textContent = data.latest.passRate + '%';
+      document.getElementById('statTotal').textContent = data.latest.total;
+      document.getElementById('statPassed').textContent = data.latest.passed;
+      document.getElementById('statFailed').textContent = data.latest.failed;
+      document.getElementById('totalRuns').textContent = data.count;
+      
+      // 更新趋势指标
+      const trendElement = document.getElementById('statPassRateTrend');
+      if (data.previous) {
+        const diff = parseFloat(data.latest.passRate) - parseFloat(data.previous.passRate);
+        const isUp = diff > 0;
+        trendElement.className = 'stat-trend ' + (isUp ? 'trend-up' : 'trend-down');
+        trendElement.textContent = (isUp ? '↑' : '↓') + ' ' + Math.abs(diff).toFixed(2) + '%';
+      } else {
+        trendElement.textContent = '-';
+      }
+      
+      // 销毁旧图表
+      if (currentChart1) currentChart1.destroy();
+      if (currentChart2) currentChart2.destroy();
+      
+      // 创建通过率趋势图
+      const passRateCtx = document.getElementById('passRateChart').getContext('2d');
+      currentChart1 = new Chart(passRateCtx, {
+      type: 'line',
+      data: {
+        labels: data.labels,
+        datasets: [{
+          label: '通过率 (%)',
+          data: data.passRateData,
+          borderColor: 'rgb(16, 185, 129)',
+          backgroundColor: 'rgba(16, 185, 129, 0.1)',
+          borderWidth: 3,
+          tension: 0.4,
+          fill: true,
+          pointRadius: 5,
+          pointHoverRadius: 7,
+          pointBackgroundColor: 'rgb(16, 185, 129)',
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true, position: 'top' },
+          tooltip: {
+            callbacks: {
+              label: function(context) {
+                return context.dataset.label + ': ' + context.parsed.y.toFixed(2) + '%';
+              }
+            }
+          }
+        },
+        scales: {
+          y: {
+            beginAtZero: true,
+            max: 100,
+            ticks: {
+              callback: function(value) { return value + '%'; }
+            }
+          }
+        }
+      }
+    });
+
+      // 创建文件数量趋势图
+      const filesCtx = document.getElementById('filesChart').getContext('2d');
+      currentChart2 = new Chart(filesCtx, {
+      type: 'bar',
+      data: {
+        labels: data.labels,
+        datasets: [
+          {
+            label: '✅ 通过',
+            data: data.passedData,
+            backgroundColor: 'rgba(16, 185, 129, 0.8)',
+            borderColor: 'rgb(16, 185, 129)',
+            borderWidth: 1
+          },
+          {
+            label: '❌ 失败',
+            data: data.failedData,
+            backgroundColor: 'rgba(239, 68, 68, 0.8)',
+            borderColor: 'rgb(239, 68, 68)',
+            borderWidth: 1
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true, position: 'top' },
+          tooltip: {
+            mode: 'index',
+            intersect: false
+          }
+        },
+        scales: {
+          x: { stacked: false },
+          y: { stacked: false, beginAtZero: true }
+        }
+      }
+    });
+    }
+    
+    // 目录切换事件
+    document.getElementById('dirSelector').addEventListener('change', function(e) {
+      initCharts(e.target.value);
+    });
+    
+    // 初始化默认目录
+    initCharts('/Users/million_mo/projects/hmos_projects/hmosworld/HMOSWorld/Application/');
+  </script>
+</body>
+</html>

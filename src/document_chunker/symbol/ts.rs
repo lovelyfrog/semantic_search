@@ -1,21 +1,21 @@
 use std::path::Path;
 
-type ByteRange = std::ops::Range<usize>;
-
 use async_trait::async_trait;
-use lsp_types::{Position, Range as LspRange};
+use lsp_types::Position;
 use parking_lot::Mutex;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Parser;
 
 use crate::common::FileService;
-use crate::common::data::{Chunk, ChunkInfo, IndexType};
+use crate::common::data::Chunk;
 use crate::document_chunker::chunker::Chunker;
+use crate::document_chunker::symbol::{SymbolKind, SymbolPipeline};
 use crate::language::language::Language;
 
 pub struct TsChunker {
     parser_ts: Mutex<Parser>,
     parser_tsx: Mutex<Parser>,
     file_service: FileService,
+    pipeline: SymbolPipeline,
 }
 
 impl TsChunker {
@@ -32,6 +32,7 @@ impl TsChunker {
             parser_ts: Mutex::new(parser_ts),
             parser_tsx: Mutex::new(parser_tsx),
             file_service: FileService::new(),
+            pipeline: SymbolPipeline::new(Language::Typescript.id()),
         })
     }
 }
@@ -52,35 +53,12 @@ impl Chunker for TsChunker {
                 .ok_or_else(|| anyhow::anyhow!("tree-sitter parse returned None"))?
         };
 
-        let mut symbols: Vec<(ByteRange, TsSymbolKind, String)> = Vec::new();
-        collect_symbols(tree.root_node(), &source, &mut symbols);
-
-        symbols.retain(|(r, _, _)| !r.is_empty());
-        symbols.sort_by_key(|(r, _, _)| r.end - r.start);
-        let symbols = pick_non_overlapping(symbols);
-
-        let chunk_count = symbols.len();
-        let mut chunks = Vec::with_capacity(chunk_count);
-        let lang_id = Language::Typescript.id();
-
-        for (idx, (range, kind, name)) in symbols.into_iter().enumerate() {
-            let content = source.get(range.clone()).unwrap_or("").to_string();
-            let embedding_content = format!("[{}] {}\n{}", kind.as_label(), name, content);
-            chunks.push(Chunk {
-                embedding_content,
-                info: ChunkInfo {
-                    layer: IndexType::Symbol,
-                    lang: lang_id.clone(),
-                    file_path: relative_path.to_string(),
-                    content: Some(content),
-                    range: Some(range_to_lsp(&source, &range)),
-                },
-                is_last: idx + 1 == chunk_count,
-                ..Default::default()
-            });
-        }
-
-        Ok(chunks)
+        Ok(self.pipeline.split_file_to_chunks(
+            &tree,
+            &source,
+            relative_path,
+            SymbolKind::from_node_kind,
+        ))
     }
 }
 
@@ -89,108 +67,6 @@ fn is_tsx(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("tsx"))
         .unwrap_or(false)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TsSymbolKind {
-    Class,
-    Interface,
-    Function,
-    Method,
-    Enum,
-    // TS has no native struct keyword; we map type aliases to struct-like chunks.
-    Struct,
-}
-
-impl TsSymbolKind {
-    fn as_label(self) -> &'static str {
-        match self {
-            Self::Class => "class",
-            Self::Interface => "interface",
-            Self::Function => "function",
-            Self::Method => "method",
-            Self::Enum => "enum",
-            Self::Struct => "struct",
-        }
-    }
-
-    fn from_node_kind(kind: &str) -> Option<Self> {
-        match kind {
-            "class_declaration" | "abstract_class_declaration" => Some(Self::Class),
-            "interface_declaration" => Some(Self::Interface),
-            "function_declaration" | "generator_function_declaration" => Some(Self::Function),
-            "method_definition" => Some(Self::Method),
-            "enum_declaration" => Some(Self::Enum),
-            "type_alias_declaration" => Some(Self::Struct),
-            _ => None,
-        }
-    }
-}
-
-fn collect_symbols(node: Node<'_>, source: &str, out: &mut Vec<(ByteRange, TsSymbolKind, String)>) {
-    if let Some(kind) = TsSymbolKind::from_node_kind(node.kind()) {
-        let name = node
-            .child_by_field_name("name")
-            .map(|n| source[n.byte_range()].to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "<anonymous>".to_string());
-        out.push((node.start_byte()..node.end_byte(), kind, name));
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_symbols(child, source, out);
-    }
-}
-
-// Prefer narrower nodes for overlap (method over class).
-fn pick_non_overlapping(
-    mut sorted_by_len: Vec<(ByteRange, TsSymbolKind, String)>,
-) -> Vec<(ByteRange, TsSymbolKind, String)> {
-    let mut chosen: Vec<(ByteRange, TsSymbolKind, String)> = Vec::new();
-    'next: for (range, kind, name) in sorted_by_len.drain(..) {
-        for (existing, _, _) in &chosen {
-            if ranges_overlap(&range, existing) {
-                continue 'next;
-            }
-        }
-        chosen.push((range, kind, name));
-    }
-    chosen.sort_by_key(|(range, _, _)| range.start);
-    chosen
-}
-
-fn ranges_overlap(a: &ByteRange, b: &ByteRange) -> bool {
-    a.start < b.end && b.start < a.end
-}
-
-fn range_to_lsp(source: &str, range: &ByteRange) -> LspRange {
-    LspRange {
-        start: byte_offset_to_position(source, range.start),
-        end: byte_offset_to_position(source, range.end),
-    }
-}
-
-fn byte_offset_to_position(text: &str, offset: usize) -> Position {
-    let mut line = 0u32;
-    let mut col_utf16 = 0u32;
-    let mut i = 0usize;
-    for ch in text.chars() {
-        if i >= offset {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col_utf16 = 0;
-        } else {
-            col_utf16 += ch.len_utf16() as u32;
-        }
-        i += ch.len_utf8();
-    }
-    Position {
-        line,
-        character: col_utf16,
-    }
 }
 
 #[cfg(test)]
@@ -209,31 +85,8 @@ mod tests {
         (path, dir)
     }
 
-    fn first_line(s: &str) -> &str {
-        s.lines().next().unwrap_or("")
-    }
-
-    fn position_to_offset(text: &str, pos: Position) -> usize {
-        let mut line = 0u32;
-        let mut col_utf16 = 0u32;
-        let mut offset = 0usize;
-        for ch in text.chars() {
-            if line == pos.line && col_utf16 >= pos.character {
-                break;
-            }
-            if ch == '\n' {
-                line += 1;
-                col_utf16 = 0;
-            } else {
-                col_utf16 += ch.len_utf16() as u32;
-            }
-            offset += ch.len_utf8();
-        }
-        offset
-    }
-
     #[tokio::test]
-    async fn split_sets_content_and_range() {
+    async fn split_parses_common_symbol_kinds() {
         let src = r#"export interface Iface {
   x: number;
 }
@@ -251,40 +104,19 @@ export class WithMethod {
         let (path, dir) = temp_ts_file("sample.ts", src);
         let chunker = TsChunker::new().expect("TsChunker::new");
         let chunks = chunker.split(&path, "sample.ts").await.expect("split");
-
         assert!(!chunks.is_empty());
 
-        let headers: Vec<&str> = chunks
-            .iter()
-            .map(|c| first_line(&c.embedding_content))
-            .collect();
-        assert!(headers.iter().any(|h| *h == "[interface] Iface"));
-        assert!(headers.iter().any(|h| *h == "[enum] En"));
-        assert!(headers.iter().any(|h| *h == "[struct] StructLike"));
-        assert!(headers.iter().any(|h| *h == "[function] fnTop"));
-        assert!(headers.iter().any(|h| *h == "[class] Empty"));
-        assert!(headers.iter().any(|h| *h == "[method] methodInClass"));
-
-        for chunk in &chunks {
-            let content = chunk.info.content.as_ref().expect("content should be set");
-            let range = chunk.info.range.as_ref().expect("range should be set");
-            assert!(!content.is_empty());
-
-            let start = position_to_offset(src, range.start);
-            let end = position_to_offset(src, range.end);
-            assert!(
-                start <= end && end <= src.len(),
-                "invalid range: {:?}",
-                range
-            );
-
-            let slice = &src[start..end];
-            assert_eq!(
-                slice,
-                content,
-                "content should match source slice by range for {:?}",
-                first_line(&chunk.embedding_content)
-            );
+        let chunks_gt = vec![
+            "Iface",
+            "En",
+            "StructLike",
+            "fnTop",
+            "Empty",
+            "WithMethod",
+            "methodInClass",
+        ];
+        for (chunk, chunk_gt) in chunks.iter().zip(chunks_gt.iter()) {
+            assert_eq!(chunk.embedding_content, *chunk_gt);
         }
 
         fs::remove_dir_all(&dir).ok();

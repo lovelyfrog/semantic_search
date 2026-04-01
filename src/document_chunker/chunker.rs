@@ -40,10 +40,12 @@ impl ChunkerRegistry {
 
     pub fn register_chunkers(&mut self) {
         self.register(ChunkerKey::File, Arc::new(FileChunker::new()));
-        self.register(
-            ChunkerKey::Symbol(Language::Arkts),
-            Arc::new(ArkTsChunker::new()),
-        );
+        if let Ok(arkts_chunker) = ArkTsChunker::new() {
+            self.register(
+                ChunkerKey::Symbol(Language::Arkts),
+                Arc::new(arkts_chunker),
+            );
+        }
 
         if let Ok(ts_chunker) = TsChunker::new() {
             self.register(
