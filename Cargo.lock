@@ -4873,6 +4873,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-for-cangjie"
+version = "0.1.0"
+source = "git+https://gitcode.com/2301_81676461/tree-sitter-for-cangjie#579f3da3a66f15aad073e07bc0cf3cc7ca026d02"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-language"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5089,6 +5098,7 @@ dependencies = [
  "tokio",
  "tree-sitter",
  "tree-sitter-arkts",
+ "tree-sitter-for-cangjie",
  "tree-sitter-typescript",
  "uuid",
 ]
