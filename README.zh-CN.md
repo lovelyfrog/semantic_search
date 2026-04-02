@@ -11,6 +11,7 @@
 - **嵌入**：`OnnxEmbedder` 批量推理，可配置图优化级别（对部分 FP16 模型可降级以避免图优化错误）。
 - **分块**：通过 `ChunkerRegistry` 注册分块器（如整文件、tree-sitter TypeScript 符号级）。
 - **指标**：索引阶段的耗时与资源画像（`metrics` 模块）。
+- **CLI / MCP 集成**：支持通过 `semantic-search index` / `semantic-search search` 以及 `semantic-search-mcp` 暴露给 Cursor、OpenCode、ClaudeCode、OpenClaw 等产品，并映射为 `/index`、`/search` 或 MCP tools。
 
 ## 环境要求
 
@@ -47,6 +48,22 @@ cargo fmt --all
 ## 设计文档
 
 详细架构、数据流与模块职责见 **[`docs/DESIGN.md`](docs/DESIGN.md)**。
+
+## 产品集成
+
+如果你希望在 Cursor、OpenCode、ClaudeCode、OpenClaw 等产品中直接使用：
+
+- `/index` 进行索引
+- `/search <query>` 进行语义搜索
+- 在回答代码问题时优先调用 `search`
+
+请参考 **[`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md)**，其中包含：
+
+- slash command 到 CLI 的映射规范
+- MCP server 的接入方式
+- 环境变量配置方式
+- 各产品的命令模板示例
+- “先 index 后 search”与“边 index 边 search”的使用约定
 
 ## 许可证
 

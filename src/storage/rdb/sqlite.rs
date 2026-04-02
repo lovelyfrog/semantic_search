@@ -284,7 +284,7 @@ mod tests {
     }
 
     fn setup_store() -> IndexStatusStore {
-        let db_path = temp_dir().join("db/test.db");
+        let db_path = temp_dir().join(format!("db/test_{}.db", uuid::Uuid::new_v4()));
         IndexStatusStore::new(db_path)
     }
     #[test]

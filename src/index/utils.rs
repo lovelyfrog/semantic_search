@@ -1,5 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct IndexProgress {
     pub total_file_count: usize,
     pub total_symbol_count: usize,
@@ -45,6 +48,7 @@ pub trait CancelToken: Send + Sync {
     fn is_cancelled(&self) -> bool;
 }
 
+#[derive(Debug)]
 pub struct SimpleCancelToken {
     cancelled: AtomicBool,
 }

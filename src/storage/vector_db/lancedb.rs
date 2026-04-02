@@ -255,7 +255,7 @@ mod tests {
     }
 
     async fn setup_table(identifier: &str) -> Result<LancedbChunkStore> {
-        let dir = temp_dir().join("db");
+        let dir = temp_dir().join(format!("vectordb_{}", uuid::Uuid::new_v4()));
         let db = LancedbChunkStore::open(&dir, 2).await?;
 
         db.delete_table(identifier, IndexType::File).await?;

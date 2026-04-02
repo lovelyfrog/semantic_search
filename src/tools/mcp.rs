@@ -1,0 +1,486 @@
+use std::{borrow::Cow, fs, path::PathBuf, sync::Arc};
+
+use anyhow::anyhow;
+use async_trait::async_trait;
+use clap::Parser;
+use rmcp::{
+    ServerHandler, ServiceExt,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{
+        CallToolResult, Content, ErrorCode, ErrorData as McpError, Implementation,
+        ProtocolVersion, ServerCapabilities, ServerInfo,
+    },
+    schemars, tool, tool_handler, tool_router,
+    transport::stdio,
+};
+
+use crate::{
+    common::logger::init_logger,
+    embedding::utils::OnnxRuntimeConfig,
+    storage::manager::StorageOptions,
+    tools::service::{
+        CommandHandler, CommandResponse, IndexProgressRequest, IndexRequest, LayerSelector,
+        ManagerBackend, ModelTypeArg, OutputFormat, ResolvedConfig, SearchRequest, StartIndexRequest,
+        StopIndexRequest,
+    },
+};
+
+#[derive(Debug, Clone, Parser)]
+#[command(name = "semantic-search-mcp")]
+#[command(about = "MCP server exposing semantic index and search tools")]
+pub struct McpServerCli {
+    #[arg(long, env = "SEMANTIC_SEARCH_PROJECT")]
+    pub project: PathBuf,
+
+    #[arg(long, env = "SEMANTIC_SEARCH_INDEX_DB")]
+    pub index_db_path: Option<PathBuf>,
+
+    #[arg(long, env = "SEMANTIC_SEARCH_VECTOR_DB")]
+    pub vector_db_path: Option<PathBuf>,
+
+    #[arg(long, env = "SEMANTIC_SEARCH_ONNX_RUNTIME")]
+    pub onnx_runtime_path: Option<PathBuf>,
+
+    #[arg(long, env = "SEMANTIC_SEARCH_MODEL")]
+    pub model_path: Option<PathBuf>,
+
+    #[arg(long, env = "SEMANTIC_SEARCH_TOKENIZER")]
+    pub tokenizer_path: Option<PathBuf>,
+
+    #[arg(long, env = "SEMANTIC_SEARCH_MODEL_TYPE", value_enum, default_value_t = ModelTypeArg::Veso)]
+    pub model_type: ModelTypeArg,
+
+    #[arg(long, env = "SEMANTIC_SEARCH_EMBEDDING_DIM", default_value_t = 768)]
+    pub dim: usize,
+
+    #[arg(long, env = "SEMANTIC_SEARCH_BATCH_SIZE", default_value_t = 32)]
+    pub batch_size: usize,
+
+    #[arg(long, env = "SEMANTIC_SEARCH_THREADS", default_value_t = 1)]
+    pub num_threads: usize,
+
+    #[arg(long, env = "SEMANTIC_SEARCH_INTRA_THREADS", default_value_t = 1)]
+    pub intra_threads: usize,
+
+    #[arg(long, env = "SEMANTIC_SEARCH_LOG_PATH")]
+    pub log_path: Option<PathBuf>,
+
+    #[arg(long, env = "SEMANTIC_SEARCH_LOG_LEVEL", default_value = "info")]
+    pub log_level: String,
+}
+
+impl McpServerCli {
+    pub fn resolve(&self) -> anyhow::Result<ResolvedConfig> {
+        if !self.project.exists() {
+            return Err(anyhow!("project path does not exist: {}", self.project.display()));
+        }
+        let default_paths = crate::resources::data_dir::platform_default_data_paths()?;
+
+        let index_db_path = self
+            .index_db_path
+            .clone()
+            .unwrap_or_else(|| default_paths.index_db_path.clone());
+        let vector_db_path = self
+            .vector_db_path
+            .clone()
+            .unwrap_or_else(|| default_paths.vector_db_path.clone());
+        let log_path = self
+            .log_path
+            .clone()
+            .unwrap_or_else(|| default_paths.log_path.clone());
+
+        if let Some(parent) = index_db_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::create_dir_all(&vector_db_path)?;
+        if let Some(parent) = log_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        init_logger(
+            log_path
+                .to_str()
+                .ok_or_else(|| anyhow!("log path must be valid UTF-8"))?,
+            &self.log_level,
+        )?;
+
+        let model_type: crate::embedding::utils::EmbeddingModelType = self.model_type.into();
+        let runtime_path = match &self.onnx_runtime_path {
+            Some(p) => p.to_string_lossy().to_string(),
+            None => crate::resources::paths::default_onnxruntime_path()?.to_string_lossy().to_string(),
+        };
+        let model_path = match &self.model_path {
+            Some(p) => p.clone(),
+            None => crate::resources::paths::default_embedding_model_path(model_type.clone())?,
+        };
+        let tokenizer_path = match &self.tokenizer_path {
+            Some(p) => p.clone(),
+            None => crate::resources::paths::default_tokenizer_path(model_type)?,
+        };
+
+        Ok(ResolvedConfig {
+            project: self.project.clone(),
+            storage_options: StorageOptions {
+                index_db_path,
+                vector_db_path,
+            },
+            onnx_runtime_config: OnnxRuntimeConfig {
+                runtime_path,
+                intra_threads: self.intra_threads,
+                optimization_level: ort::session::builder::GraphOptimizationLevel::Level1,
+            },
+            embedding_options: crate::embedding::utils::EmbeddingOptions {
+                model_type: self.model_type.into(),
+                model_path,
+                tokenizer_path,
+                dim: self.dim,
+                batch_size: self.batch_size,
+                num_threads: self.num_threads,
+            },
+            output: OutputFormat::Json,
+        })
+    }
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct IndexToolRequest {
+    #[schemars(description = "Index layer to build: file, symbol, content, or all (file+symbol)")]
+    pub layer: Option<IndexLayerArg>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct StartIndexToolRequest {
+    #[schemars(description = "Index layer to build: file, symbol, content, or all (file+symbol)")]
+    pub layer: Option<IndexLayerArg>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct IndexProgressToolRequest {}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct StopIndexToolRequest {}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SearchToolRequest {
+    #[schemars(description = "Semantic query string")]
+    pub query: String,
+    #[schemars(description = "Search layer: file, symbol, content, or all (file+symbol)")]
+    pub layer: Option<IndexLayerArg>,
+    #[schemars(description = "Maximum number of hits to return")]
+    pub limit: Option<usize>,
+    #[schemars(description = "Minimum similarity threshold")]
+    pub threshold: Option<f32>,
+    #[schemars(description = "Optional relative paths to filter by")]
+    pub paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexLayerArg {
+    File,
+    Symbol,
+    Content,
+    All,
+}
+
+impl From<IndexLayerArg> for LayerSelector {
+    fn from(value: IndexLayerArg) -> Self {
+        match value {
+            IndexLayerArg::File => LayerSelector::File,
+            IndexLayerArg::Symbol => LayerSelector::Symbol,
+            IndexLayerArg::Content => LayerSelector::Content,
+            IndexLayerArg::All => LayerSelector::All,
+        }
+    }
+}
+
+pub struct SemanticSearchMcp {
+    tool_router: ToolRouter<SemanticSearchMcp>,
+    executor: Arc<dyn McpCommandExecutor>,
+    project: String,
+}
+
+#[async_trait]
+trait McpCommandExecutor: Send + Sync {
+    async fn execute_index(&self, request: IndexRequest) -> anyhow::Result<CommandResponse>;
+    async fn execute_start_index(&self, request: StartIndexRequest) -> anyhow::Result<CommandResponse>;
+    async fn execute_index_progress(&self, request: IndexProgressRequest) -> anyhow::Result<CommandResponse>;
+    async fn execute_stop_index(&self, request: StopIndexRequest) -> anyhow::Result<CommandResponse>;
+    async fn execute_search(&self, request: SearchRequest) -> anyhow::Result<CommandResponse>;
+}
+
+#[async_trait]
+impl<B> McpCommandExecutor for CommandHandler<B>
+where
+    B: crate::tools::service::SemanticSearchBackend + Send + Sync,
+{
+    async fn execute_index(&self, request: IndexRequest) -> anyhow::Result<CommandResponse> {
+        CommandHandler::execute_index(self, request).await
+    }
+
+    async fn execute_start_index(&self, request: StartIndexRequest) -> anyhow::Result<CommandResponse> {
+        CommandHandler::execute_start_index(self, request).await
+    }
+
+    async fn execute_index_progress(
+        &self,
+        request: IndexProgressRequest,
+    ) -> anyhow::Result<CommandResponse> {
+        CommandHandler::execute_index_progress(self, request).await
+    }
+
+    async fn execute_stop_index(&self, request: StopIndexRequest) -> anyhow::Result<CommandResponse> {
+        CommandHandler::execute_stop_index(self, request).await
+    }
+
+    async fn execute_search(&self, request: SearchRequest) -> anyhow::Result<CommandResponse> {
+        CommandHandler::execute_search(self, request).await
+    }
+}
+
+#[tool_router]
+impl SemanticSearchMcp {
+    pub async fn from_config(config: ResolvedConfig) -> anyhow::Result<Self> {
+        let backend = ManagerBackend::new(&config).await?;
+        Ok(Self {
+            tool_router: Self::tool_router(),
+            executor: Arc::new(CommandHandler::new(backend)),
+            project: config.project.to_string_lossy().to_string(),
+        })
+    }
+
+    #[tool(description = "Build or refresh semantic indexes for the configured repository")]
+    pub async fn index(
+        &self,
+        request: Parameters<IndexToolRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(request) = request;
+        let response = self
+            .executor
+            .execute_index(IndexRequest {
+                project: self.project.clone(),
+                layer: request.layer.unwrap_or(IndexLayerArg::All).into(),
+            })
+            .await
+            .map_err(mcp_error)?;
+        Ok(json_tool_result(response))
+    }
+
+    #[tool(description = "Start indexing in background (non-blocking)")]
+    pub async fn start_index(
+        &self,
+        request: Parameters<StartIndexToolRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(request) = request;
+        let response = self
+            .executor
+            .execute_start_index(StartIndexRequest {
+                project: self.project.clone(),
+                layer: request.layer.unwrap_or(IndexLayerArg::All).into(),
+            })
+            .await
+            .map_err(mcp_error)?;
+        Ok(json_tool_result(response))
+    }
+
+    #[tool(description = "Get current indexing progress and status")]
+    pub async fn index_progress(
+        &self,
+        _request: Parameters<IndexProgressToolRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let response = self
+            .executor
+            .execute_index_progress(IndexProgressRequest {
+                project: self.project.clone(),
+            })
+            .await
+            .map_err(mcp_error)?;
+        Ok(json_tool_result(response))
+    }
+
+    #[tool(description = "Stop/cancel current indexing task")]
+    pub async fn stop_index(
+        &self,
+        _request: Parameters<StopIndexToolRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let response = self
+            .executor
+            .execute_stop_index(StopIndexRequest {
+                project: self.project.clone(),
+            })
+            .await
+            .map_err(mcp_error)?;
+        Ok(json_tool_result(response))
+    }
+
+    #[tool(description = "Search the configured repository semantic index")]
+    pub async fn search(
+        &self,
+        request: Parameters<SearchToolRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(request) = request;
+        let response = self
+            .executor
+            .execute_search(SearchRequest {
+                project: self.project.clone(),
+                query: request.query,
+                layer: request.layer.unwrap_or(IndexLayerArg::Symbol).into(),
+                limit: request.limit.unwrap_or(10),
+                threshold: request.threshold.unwrap_or(0.5),
+                paths: request.paths.unwrap_or_default(),
+            })
+            .await
+            .map_err(mcp_error)?;
+        Ok(json_tool_result(response))
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for SemanticSearchMcp {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_server_info(Implementation::from_build_env())
+            .with_instructions(
+                "Use `index` before `search` for a new repository. When answering code questions like where, how, or who calls what, prefer `search`. Searching during indexing is allowed but may return partial results.",
+            )
+    }
+}
+
+fn json_tool_result(response: crate::tools::service::CommandResponse) -> CallToolResult {
+    let json = response
+        .render(OutputFormat::Json)
+        .unwrap_or_else(|err| format!("{{\"error\":\"{}\"}}", err));
+    CallToolResult::success(vec![Content::text(json)])
+}
+
+fn mcp_error(error: anyhow::Error) -> McpError {
+    McpError {
+        code: ErrorCode(-32603),
+        message: Cow::from(error.to_string()),
+        data: None,
+    }
+}
+
+pub async fn run_mcp_server(cli: McpServerCli) -> anyhow::Result<()> {
+    let config = cli.resolve()?;
+    let service = SemanticSearchMcp::from_config(config).await?.serve(stdio()).await?;
+    service.waiting().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::data::IndexMetrics;
+
+    struct MockExecutor;
+
+    #[async_trait]
+    impl McpCommandExecutor for MockExecutor {
+        async fn execute_index(&self, request: IndexRequest) -> anyhow::Result<CommandResponse> {
+            Ok(CommandResponse::Index(crate::tools::service::IndexResponse {
+                project: request.project,
+                layers: vec![request.layer.to_layers()[0].to_string()],
+                metrics: IndexMetrics::default(),
+                usage_hint: "hint".to_string(),
+            }))
+        }
+
+        async fn execute_start_index(
+            &self,
+            request: StartIndexRequest,
+        ) -> anyhow::Result<CommandResponse> {
+            Ok(CommandResponse::StartIndex(crate::tools::service::StartIndexResponse {
+                project: request.project,
+                layers: vec![request.layer.to_layers()[0].to_string()],
+                status: crate::tools::service::IndexRunStatus::Running,
+                usage_hint: "hint".to_string(),
+            }))
+        }
+
+        async fn execute_index_progress(
+            &self,
+            request: IndexProgressRequest,
+        ) -> anyhow::Result<CommandResponse> {
+            Ok(CommandResponse::IndexProgress(crate::tools::service::IndexProgressResponse {
+                project: request.project,
+                status: crate::tools::service::IndexRunStatus::Running,
+                progress: crate::index::utils::IndexProgress {
+                    total_file_count: 1,
+                    total_symbol_count: 1,
+                    handled_file_count: 0,
+                    handled_symbol_count: 0,
+                },
+                last_error: None,
+                usage_hint: "hint".to_string(),
+            }))
+        }
+
+        async fn execute_stop_index(&self, request: StopIndexRequest) -> anyhow::Result<CommandResponse> {
+            Ok(CommandResponse::StopIndex(crate::tools::service::StopIndexResponse {
+                project: request.project,
+                status: crate::tools::service::IndexRunStatus::Cancelled,
+                usage_hint: "hint".to_string(),
+            }))
+        }
+
+        async fn execute_search(&self, request: SearchRequest) -> anyhow::Result<CommandResponse> {
+            let layer_label = match request.layer {
+                crate::tools::service::LayerSelector::File => "file",
+                crate::tools::service::LayerSelector::Symbol => "symbol",
+                crate::tools::service::LayerSelector::Content => "content",
+                crate::tools::service::LayerSelector::All => "all",
+            };
+            Ok(CommandResponse::Search(crate::tools::service::SearchResponse {
+                project: request.project,
+                query: request.query,
+                layer: layer_label.to_string(),
+                limit: request.limit,
+                threshold: request.threshold,
+                usage_hint: "hint".to_string(),
+                results: vec![],
+            }))
+        }
+    }
+
+    fn test_server() -> SemanticSearchMcp {
+        SemanticSearchMcp {
+            tool_router: SemanticSearchMcp::tool_router(),
+            executor: Arc::new(MockExecutor),
+            project: "/tmp/repo".to_string(),
+        }
+    }
+
+    #[test]
+    fn tool_router_registers_index_and_search() {
+        let server = test_server();
+        let tools = server.tool_router.list_all();
+        let names = tools.into_iter().map(|tool| tool.name.to_string()).collect::<Vec<_>>();
+        assert!(names.contains(&"index".to_string()));
+        assert!(names.contains(&"start_index".to_string()));
+        assert!(names.contains(&"index_progress".to_string()));
+        assert!(names.contains(&"stop_index".to_string()));
+        assert!(names.contains(&"search".to_string()));
+    }
+
+    #[tokio::test]
+    async fn search_tool_returns_json_text_payload() {
+        let server = test_server();
+        let result = server
+            .search(Parameters(SearchToolRequest {
+                query: "audio player".to_string(),
+                layer: Some(IndexLayerArg::Symbol),
+                limit: Some(5),
+                threshold: Some(0.4),
+                paths: Some(vec!["src/a.ts".to_string()]),
+            }))
+            .await
+            .expect("search tool");
+
+        let rendered = format!("{result:?}");
+        assert!(rendered.contains("audio player"));
+        assert!(rendered.contains("symbol"));
+        assert!(rendered.contains("hint"));
+    }
+}

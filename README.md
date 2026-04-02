@@ -11,6 +11,7 @@ A Rust library for **semantic search** over codebases: chunk documents, embed wi
 - **Embedding**: `OnnxEmbedder` with batching and configurable graph optimization (with safe fallback for some FP16 models).
 - **Chunking**: pluggable chunkers (e.g. whole-file, tree-sitter TypeScript symbols) via `ChunkerRegistry`.
 - **Metrics**: index profiling and stage timers (`metrics` module).
+- **CLI / MCP integration**: expose `semantic-search index` / `semantic-search search` and `semantic-search-mcp` so products like Cursor and OpenCode can map them to `/index`, `/search`, or MCP tools.
 
 ## Requirements
 
@@ -47,6 +48,7 @@ Optional: install `cargo install cargo-make`, then `cargo make fmt-fix` / `cargo
 ## Documentation
 
 - Design (English-friendly diagrams and tables): [`docs/DESIGN.md`](docs/DESIGN.md) — written in Chinese; use a translator or read code comments alongside.
+- Product integration, slash-command mapping, and MCP usage: [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md)
 
 ## License
 

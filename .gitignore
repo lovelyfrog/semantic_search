@@ -25,3 +25,6 @@ ehthumbs.db
 
 # Logs
 *.log
+
+# resources
+resources/

@@ -11,3 +11,4 @@ pub mod test;
 pub mod tools;
 
 pub mod manager;
+pub mod resources;

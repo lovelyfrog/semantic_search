@@ -112,7 +112,7 @@ impl Debug for ChunkMsg {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QueryResult {
     pub score: f32,
     pub info: ChunkInfo,

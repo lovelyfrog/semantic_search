@@ -7,6 +7,9 @@ use log4rs::{
     config::{Appender, Root},
     encode::{Encode, Write},
 };
+use std::sync::OnceLock;
+
+static LOG4RS_HANDLE: OnceLock<log4rs::Handle> = OnceLock::new();
 
 #[derive(Debug)]
 struct ModulePatternEncoder;
@@ -75,7 +78,22 @@ pub fn init_logger(log_path: &str, level: &str) -> anyhow::Result<()> {
         .build(Root::builder().appender("file").build(level_filter))
         .map_err(|e| anyhow::anyhow!("failed to build log config: {}", e))?;
 
-    log4rs::init_config(config).map_err(|e| anyhow::anyhow!("failed to init logger: {}", e))?;
+    if let Some(handle) = LOG4RS_HANDLE.get() {
+        handle.set_config(config);
+        return Ok(());
+    }
+
+    let handle = match log4rs::init_config(config) {
+        Ok(handle) => handle,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("already initialized") || msg.contains("already been initialized") {
+                return Err(anyhow::anyhow!("logger already initialized"));
+            }
+            return Err(anyhow::anyhow!("failed to init logger: {}", e));
+        }
+    };
+    let _ = LOG4RS_HANDLE.set(handle);
 
     Ok(())
 }
@@ -95,7 +113,14 @@ mod tests {
             std::env::temp_dir().join(format!("vnext_init_logger_{}.log", uuid::Uuid::new_v4()));
         let _ = fs::remove_file(&path);
 
-        init_logger(path.to_str().expect("utf8 path"), "info").expect("init_logger");
+        if let Err(e) = init_logger(path.to_str().expect("utf8 path"), "info") {
+            if e.to_string().contains("logger already initialized") {
+                // Another test (or dependency) installed a global logger first.
+                // This test can't reliably assert file output in that situation.
+                return;
+            }
+            panic!("init_logger: {e}");
+        }
 
         log::info!("integration probe");
         log::logger().flush();

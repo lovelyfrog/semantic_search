@@ -1,6 +1,8 @@
 use std::{fmt, time::Duration};
 
-#[derive(Clone, Debug, Default)]
+use serde::Serialize;
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct IndexMetrics {
     pub total_time: Duration,
 
