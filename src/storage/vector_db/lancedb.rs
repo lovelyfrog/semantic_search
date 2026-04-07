@@ -251,7 +251,7 @@ mod tests {
     use crate::common::data::{Chunk, ChunkInfo, IndexType};
 
     async fn setup_table() -> Result<LancedbChunkStore> {
-        let dir = temp_dir().join(format!("vectordb_{}", uuid::Uuid::new_v4()));
+        let dir = temp_dir().join(format!("db/vectordb_{}", uuid::Uuid::new_v4()));
         let db = LancedbChunkStore::open(&dir, 2).await?;
 
         db.delete_table(IndexType::File).await?;
