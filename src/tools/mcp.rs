@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fs, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, fs, path::{Path, PathBuf}, sync::Arc};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -17,27 +17,31 @@ use rmcp::{
 use crate::{
     common::logger::init_logger,
     embedding::utils::OnnxRuntimeConfig,
-    storage::manager::StorageOptions,
-    tools::service::{
-        CommandHandler, CommandResponse, IndexProgressRequest, IndexRequest, LayerSelector,
-        ManagerBackend, ModelTypeArg, OutputFormat, ResolvedConfig, SearchRequest, StartIndexRequest,
-        StopIndexRequest,
+    resources::{
+        data_dir::platform_log_path,
+        project_paths::{normalize_project_root, project_path_key},
+    },
+    tools::{
+        mcp_registry::{
+            mcp_storage_options_for_project_root, McpSharedConfig, ProjectRegistry,
+            RegistryCommandHandler,
+        },
+        service::{
+            validate_project_exists, CommandResponse, IndexProgressRequest,
+            LayerSelector, ModelTypeArg, OutputFormat, ResolvedConfig, SearchRequest,
+            StartIndexRequest, StopIndexRequest,
+            dispatch_execute_index_progress, dispatch_execute_search, dispatch_execute_start_index,
+            dispatch_execute_stop_index,
+        },
     },
 };
+
+use ort::session::builder::GraphOptimizationLevel;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "semantic-search-mcp")]
 #[command(about = "MCP server exposing semantic index and search tools")]
 pub struct McpServerCli {
-    #[arg(long, env = "SEMANTIC_SEARCH_PROJECT")]
-    pub project: PathBuf,
-
-    #[arg(long, env = "SEMANTIC_SEARCH_INDEX_DB")]
-    pub index_db_path: Option<PathBuf>,
-
-    #[arg(long, env = "SEMANTIC_SEARCH_VECTOR_DB")]
-    pub vector_db_path: Option<PathBuf>,
-
     #[arg(long, env = "SEMANTIC_SEARCH_ONNX_RUNTIME")]
     pub onnx_runtime_path: Option<PathBuf>,
 
@@ -62,37 +66,17 @@ pub struct McpServerCli {
     #[arg(long, env = "SEMANTIC_SEARCH_INTRA_THREADS", default_value_t = 1)]
     pub intra_threads: usize,
 
-    #[arg(long, env = "SEMANTIC_SEARCH_LOG_PATH")]
-    pub log_path: Option<PathBuf>,
-
     #[arg(long, env = "SEMANTIC_SEARCH_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
 }
 
 impl McpServerCli {
     pub fn resolve(&self) -> anyhow::Result<ResolvedConfig> {
-        if !self.project.exists() {
-            return Err(anyhow!("project path does not exist: {}", self.project.display()));
-        }
-        let default_paths = crate::resources::data_dir::platform_default_data_paths()?;
+        let log_path = match std::env::var_os("SEMANTIC_SEARCH_LOG_PATH") {
+            Some(p) => PathBuf::from(p),
+            None => platform_log_path()?,
+        };
 
-        let index_db_path = self
-            .index_db_path
-            .clone()
-            .unwrap_or_else(|| default_paths.index_db_path.clone());
-        let vector_db_path = self
-            .vector_db_path
-            .clone()
-            .unwrap_or_else(|| default_paths.vector_db_path.clone());
-        let log_path = self
-            .log_path
-            .clone()
-            .unwrap_or_else(|| default_paths.log_path.clone());
-
-        if let Some(parent) = index_db_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::create_dir_all(&vector_db_path)?;
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -119,15 +103,10 @@ impl McpServerCli {
         };
 
         Ok(ResolvedConfig {
-            project: self.project.clone(),
-            storage_options: StorageOptions {
-                index_db_path,
-                vector_db_path,
-            },
             onnx_runtime_config: OnnxRuntimeConfig {
                 runtime_path,
                 intra_threads: self.intra_threads,
-                optimization_level: ort::session::builder::GraphOptimizationLevel::Level1,
+                optimization_level: GraphOptimizationLevel::Level1,
             },
             embedding_options: crate::embedding::utils::EmbeddingOptions {
                 model_type: self.model_type.into(),
@@ -138,6 +117,7 @@ impl McpServerCli {
                 num_threads: self.num_threads,
             },
             output: OutputFormat::Json,
+            log_path,
         })
     }
 }
@@ -146,24 +126,36 @@ impl McpServerCli {
 pub struct IndexToolRequest {
     #[schemars(description = "Index layer to build: file, symbol, content, or all (file+symbol)")]
     pub layer: Option<IndexLayerArg>,
+    #[schemars(description = "Optional absolute path to repository root; if omitted, uses SEMANTIC_SEARCH_PROJECT")]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct StartIndexToolRequest {
     #[schemars(description = "Index layer to build: file, symbol, content, or all (file+symbol)")]
     pub layer: Option<IndexLayerArg>,
+    #[schemars(description = "Optional absolute path to repository root; if omitted, uses SEMANTIC_SEARCH_PROJECT")]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct IndexProgressToolRequest {}
+pub struct IndexProgressToolRequest {
+    #[schemars(description = "Optional absolute path to repository root; if omitted, uses SEMANTIC_SEARCH_PROJECT")]
+    pub project: Option<String>,
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct StopIndexToolRequest {}
+pub struct StopIndexToolRequest {
+    #[schemars(description = "Optional absolute path to repository root; if omitted, uses SEMANTIC_SEARCH_PROJECT")]
+    pub project: Option<String>,
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SearchToolRequest {
     #[schemars(description = "Semantic query string")]
     pub query: String,
+    #[schemars(description = "Optional absolute path to repository root; if omitted, uses SEMANTIC_SEARCH_PROJECT")]
+    pub project: Option<String>,
     #[schemars(description = "Search layer: file, symbol, content, or all (file+symbol)")]
     pub layer: Option<IndexLayerArg>,
     #[schemars(description = "Maximum number of hits to return")]
@@ -197,12 +189,10 @@ impl From<IndexLayerArg> for LayerSelector {
 pub struct SemanticSearchMcp {
     tool_router: ToolRouter<SemanticSearchMcp>,
     executor: Arc<dyn McpCommandExecutor>,
-    project: String,
 }
 
 #[async_trait]
 trait McpCommandExecutor: Send + Sync {
-    async fn execute_index(&self, request: IndexRequest) -> anyhow::Result<CommandResponse>;
     async fn execute_start_index(&self, request: StartIndexRequest) -> anyhow::Result<CommandResponse>;
     async fn execute_index_progress(&self, request: IndexProgressRequest) -> anyhow::Result<CommandResponse>;
     async fn execute_stop_index(&self, request: StopIndexRequest) -> anyhow::Result<CommandResponse>;
@@ -210,60 +200,73 @@ trait McpCommandExecutor: Send + Sync {
 }
 
 #[async_trait]
-impl<B> McpCommandExecutor for CommandHandler<B>
-where
-    B: crate::tools::service::SemanticSearchBackend + Send + Sync,
-{
-    async fn execute_index(&self, request: IndexRequest) -> anyhow::Result<CommandResponse> {
-        CommandHandler::execute_index(self, request).await
-    }
-
+impl McpCommandExecutor for RegistryCommandHandler {
     async fn execute_start_index(&self, request: StartIndexRequest) -> anyhow::Result<CommandResponse> {
-        CommandHandler::execute_start_index(self, request).await
+        let path = PathBuf::from(&request.project);
+        let backend = self.registry.get_or_create(&path, &self.shared).await?;
+        dispatch_execute_start_index(backend.as_ref(), request).await
     }
 
     async fn execute_index_progress(
         &self,
         request: IndexProgressRequest,
     ) -> anyhow::Result<CommandResponse> {
-        CommandHandler::execute_index_progress(self, request).await
+        let path = PathBuf::from(&request.project);
+        let backend = self.registry.get_or_create(&path, &self.shared).await?;
+        dispatch_execute_index_progress(backend.as_ref(), request).await
     }
 
     async fn execute_stop_index(&self, request: StopIndexRequest) -> anyhow::Result<CommandResponse> {
-        CommandHandler::execute_stop_index(self, request).await
+        let path = PathBuf::from(&request.project);
+        let backend = self.registry.get_or_create(&path, &self.shared).await?;
+        dispatch_execute_stop_index(backend.as_ref(), request).await
     }
 
     async fn execute_search(&self, request: SearchRequest) -> anyhow::Result<CommandResponse> {
-        CommandHandler::execute_search(self, request).await
+        let path = PathBuf::from(&request.project);
+        let backend = self.registry.get_or_create(&path, &self.shared).await?;
+        dispatch_execute_search(backend.as_ref(), request).await
+    }
+}
+
+/// 将 tool 可选 `project` 解析为与 [`project_path_key`] 一致的字符串，供 registry 与 JSON 的 `project` 字段共用。
+fn resolve_mcp_project_key(tool_project: Option<&str>) -> anyhow::Result<String> {
+    match tool_project {
+        Some(s) => {
+            let p = Path::new(s);
+            validate_project_exists(p)?;
+            project_path_key(p)
+        }
+        None => {
+            let project_raw = std::env::var_os("SEMANTIC_SEARCH_PROJECT").ok_or_else(|| {
+                anyhow!(
+                    "SEMANTIC_SEARCH_PROJECT environment variable is not set; either export it or pass `project` in the tool request"
+                )
+            })?;
+            let project_path = PathBuf::from(project_raw);
+            validate_project_exists(&project_path)?;
+            project_path_key(&project_path)
+        }
     }
 }
 
 #[tool_router]
 impl SemanticSearchMcp {
     pub async fn from_config(config: ResolvedConfig) -> anyhow::Result<Self> {
-        let backend = ManagerBackend::new(&config).await?;
+        let shared = Arc::new(McpSharedConfig {
+            onnx_runtime_path: config.onnx_runtime_config.runtime_path.clone(),
+            onnx_intra_threads: config.onnx_runtime_config.intra_threads,
+            embedding_options: config.embedding_options.clone(),
+        });
+        let registry = Arc::new(ProjectRegistry::new());
+        let handler = RegistryCommandHandler::new(
+            Arc::clone(&registry),
+            Arc::clone(&shared),
+        );
         Ok(Self {
             tool_router: Self::tool_router(),
-            executor: Arc::new(CommandHandler::new(backend)),
-            project: config.project.to_string_lossy().to_string(),
+            executor: Arc::new(handler),
         })
-    }
-
-    #[tool(description = "Build or refresh semantic indexes for the configured repository")]
-    pub async fn index(
-        &self,
-        request: Parameters<IndexToolRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let Parameters(request) = request;
-        let response = self
-            .executor
-            .execute_index(IndexRequest {
-                project: self.project.clone(),
-                layer: request.layer.unwrap_or(IndexLayerArg::All).into(),
-            })
-            .await
-            .map_err(mcp_error)?;
-        Ok(json_tool_result(response))
     }
 
     #[tool(description = "Start indexing in background (non-blocking)")]
@@ -272,10 +275,12 @@ impl SemanticSearchMcp {
         request: Parameters<StartIndexToolRequest>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(request) = request;
+        let project_key = resolve_mcp_project_key(request.project.as_deref())
+            .map_err(mcp_error)?;
         let response = self
             .executor
             .execute_start_index(StartIndexRequest {
-                project: self.project.clone(),
+                project: project_key,
                 layer: request.layer.unwrap_or(IndexLayerArg::All).into(),
             })
             .await
@@ -286,12 +291,15 @@ impl SemanticSearchMcp {
     #[tool(description = "Get current indexing progress and status")]
     pub async fn index_progress(
         &self,
-        _request: Parameters<IndexProgressToolRequest>,
+        request: Parameters<IndexProgressToolRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let Parameters(req) = request;
+        let project_key = resolve_mcp_project_key(req.project.as_deref())
+            .map_err(mcp_error)?;
         let response = self
             .executor
             .execute_index_progress(IndexProgressRequest {
-                project: self.project.clone(),
+                project: project_key,
             })
             .await
             .map_err(mcp_error)?;
@@ -301,12 +309,15 @@ impl SemanticSearchMcp {
     #[tool(description = "Stop/cancel current indexing task")]
     pub async fn stop_index(
         &self,
-        _request: Parameters<StopIndexToolRequest>,
+        request: Parameters<StopIndexToolRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let Parameters(req) = request;
+        let project_key = resolve_mcp_project_key(req.project.as_deref())
+            .map_err(mcp_error)?;
         let response = self
             .executor
             .execute_stop_index(StopIndexRequest {
-                project: self.project.clone(),
+                project: project_key,
             })
             .await
             .map_err(mcp_error)?;
@@ -319,10 +330,12 @@ impl SemanticSearchMcp {
         request: Parameters<SearchToolRequest>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(request) = request;
+        let project_key = resolve_mcp_project_key(request.project.as_deref())
+            .map_err(mcp_error)?;
         let response = self
             .executor
             .execute_search(SearchRequest {
-                project: self.project.clone(),
+                project: project_key,
                 query: request.query,
                 layer: request.layer.unwrap_or(IndexLayerArg::Symbol).into(),
                 limit: request.limit.unwrap_or(10),
@@ -342,7 +355,7 @@ impl ServerHandler for SemanticSearchMcp {
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "Use `index` before `search` for a new repository. When answering code questions like where, how, or who calls what, prefer `search`. Searching during indexing is allowed but may return partial results.",
+                "Use `start_index` before `search` for a new repository. Pass optional `project` (absolute repo root) when working with multiple directories; otherwise the server reads SEMANTIC_SEARCH_PROJECT from the environment. For code questions (where/how/who calls what), prefer `search`. Searching during indexing may return partial results.",
             )
     }
 }
@@ -372,21 +385,11 @@ pub async fn run_mcp_server(cli: McpServerCli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::data::IndexMetrics;
 
     struct MockExecutor;
 
     #[async_trait]
     impl McpCommandExecutor for MockExecutor {
-        async fn execute_index(&self, request: IndexRequest) -> anyhow::Result<CommandResponse> {
-            Ok(CommandResponse::Index(crate::tools::service::IndexResponse {
-                project: request.project,
-                layers: vec![request.layer.to_layers()[0].to_string()],
-                metrics: IndexMetrics::default(),
-                usage_hint: "hint".to_string(),
-            }))
-        }
-
         async fn execute_start_index(
             &self,
             request: StartIndexRequest,
@@ -448,7 +451,6 @@ mod tests {
         SemanticSearchMcp {
             tool_router: SemanticSearchMcp::tool_router(),
             executor: Arc::new(MockExecutor),
-            project: "/tmp/repo".to_string(),
         }
     }
 
@@ -457,7 +459,7 @@ mod tests {
         let server = test_server();
         let tools = server.tool_router.list_all();
         let names = tools.into_iter().map(|tool| tool.name.to_string()).collect::<Vec<_>>();
-        assert!(names.contains(&"index".to_string()));
+        // 阻塞式 `index` 已并入 `start_index` 语义，路由不再单独注册名为 index 的工具。
         assert!(names.contains(&"start_index".to_string()));
         assert!(names.contains(&"index_progress".to_string()));
         assert!(names.contains(&"stop_index".to_string()));
@@ -470,6 +472,7 @@ mod tests {
         let result = server
             .search(Parameters(SearchToolRequest {
                 query: "audio player".to_string(),
+                project: Some("/tmp/repo".to_string()),
                 layer: Some(IndexLayerArg::Symbol),
                 limit: Some(5),
                 threshold: Some(0.4),

@@ -148,14 +148,7 @@ impl SemanticSearchManager {
     ) -> anyhow::Result<Vec<QueryResult>> {
         let query_vector = self.embedder.embed(query)?;
         self.storage_manager
-            .search(
-                &self.project.hash,
-                query_vector,
-                limit,
-                threshold,
-                layer,
-                paths,
-            )
+            .search(query_vector, limit, threshold, layer, paths)
             .await
     }
 }

@@ -138,8 +138,6 @@ impl IndexWorker {
         profiler: Arc<IndexProfiler>,
         progress_reporter: Arc<dyn ProgressReporter>,
     ) {
-        let project_id = project.id;
-
         const BATCH_SIZE: usize = 128;
         let mut buffer = Vec::with_capacity(BATCH_SIZE);
 
@@ -161,7 +159,7 @@ impl IndexWorker {
                 ChunkMsg::FileStart { file_path } => {
                     log::info!("deleting file {} into layer {}", file_path, layer);
                     self.storage_manager
-                        .delete_chunks(&project.hash, &file_path, layer)
+                        .delete_chunks(&file_path, layer)
                         .await
                         .unwrap_or_else(|e| {
                             log::error!("failed to delete chunks for file {}: {}", file_path, e)
@@ -202,14 +200,14 @@ impl IndexWorker {
             let index_finished_time = metrics.end_time.as_secs();
             let _ = self
                 .storage_manager
-                .update_project(project_id, index_finished_time);
+                .update_project_index_finished_time(index_finished_time);
             progress_reporter.on_completed();
         }
     }
 
     async fn process_batch_insert(
         &self,
-        project: Project,
+        _project: Project,
         layer: IndexType,
         buffer: &Vec<Chunk>,
         profiler: Arc<IndexProfiler>,
@@ -220,7 +218,7 @@ impl IndexWorker {
 
         let timer = StageTimer::new(profiler.metrics(), Stage::DbWrite, layer);
         self.storage_manager
-            .append_chunks(&project.hash, layer, buffer.clone())
+            .append_chunks(layer, buffer.clone())
             .await
             .unwrap_or_else(|e| log::error!("failed to append chunks: {}", e));
         timer.finish();

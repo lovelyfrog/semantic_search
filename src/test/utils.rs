@@ -56,7 +56,7 @@ pub fn setup_embedder(
 
 pub fn init_log() {
     let log_path = temp_dir()
-        .join("logs/test.log")
+        .join("semantic_search/running.log")
         .to_string_lossy()
         .to_string();
     let _ = init_logger(&log_path, "info");
@@ -64,8 +64,8 @@ pub fn init_log() {
 
 pub fn options() -> (StorageOptions, OnnxRuntimeConfig, EmbeddingOptions) {
     let storage_options = StorageOptions {
-        index_db_path: temp_dir().join("db/test.db"),
-        vector_db_path: temp_dir().join("db/lancedb"),
+        index_db_path: temp_dir().join("semantic_search/index.db"),
+        vector_db_path: temp_dir().join("semantic_search/vectordb"),
     };
     let onnx_runtime_config = OnnxRuntimeConfig {
         runtime_path: runtime_path(),

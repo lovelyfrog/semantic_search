@@ -1,5 +1,5 @@
 use std::{collections::HashMap, fs, path::PathBuf};
-
+use std::thread::sleep;
 use rmcp::{
     model::{CallToolRequestParams, JsonObject},
     service::QuitReason,
@@ -58,17 +58,9 @@ async fn mcp_stdio_e2e_index_and_search() -> anyhow::Result<()> {
         "fn main() { println!(\"hello\"); }\n",
     )?;
 
-    let data_dir = unique_temp_dir("semantic-search-mcp-data");
-    fs::create_dir_all(&data_dir)?;
-
     let bin = env!("CARGO_BIN_EXE_semantic-search-mcp");
 
-    let mut cmd = tokio::process::Command::new(bin);
-    // Use explicit per-test storage paths for determinism/isolation.
-    let envs: HashMap<&str, String> = HashMap::from([
-        ("SEMANTIC_SEARCH_PROJECT", project_dir.to_string_lossy().to_string()),
-    ]);
-    cmd.envs(envs);
+    let cmd = tokio::process::Command::new(bin);
 
     let transport = TokioChildProcess::new(cmd)?;
 
@@ -77,30 +69,38 @@ async fn mcp_stdio_e2e_index_and_search() -> anyhow::Result<()> {
 
     let tools = client.list_all_tools().await?;
     let tool_names = tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>();
-    assert!(tool_names.contains(&"index"), "missing tool: index");
+    // MCP 侧已用 `start_index` 替代阻塞式 `index` 工具名。
+    assert!(
+        tool_names.contains(&"start_index"),
+        "missing tool: start_index"
+    );
     assert!(tool_names.contains(&"search"), "missing tool: search");
 
-    let index_result = client
+    let start_index_result = client
         .call_tool(
-            CallToolRequestParams::new("index").with_arguments(json_object(&[(
+            CallToolRequestParams::new("start_index").with_arguments(json_object(&[(
                 "layer",
                 serde_json::json!("all"),
-            )])),
+            ), ("project", serde_json::json!(project_dir.to_string_lossy().to_string()))])),
         )
         .await?;
 
-    let index_json = extract_first_text_json(&index_result)
-        .ok_or_else(|| anyhow::anyhow!("index result missing text content"))?;
-    let index_value: serde_json::Value = serde_json::from_str(index_json)?;
-    assert!(index_value.get("layers").is_some(), "index json: {index_json}");
+    let start_index_json = extract_first_text_json(&start_index_result)
+        .ok_or_else(|| anyhow::anyhow!("start_index result missing text content"))?;
+    let start_index_value: serde_json::Value = serde_json::from_str(start_index_json)?;
+    assert!(
+        start_index_value.get("layers").is_some(),
+        "start_index json: {start_index_json}"
+    );
 
     let search_result = client
         .call_tool(
             CallToolRequestParams::new("search").with_arguments(json_object(&[
                 ("query", serde_json::json!("hello")),
-                ("layer", serde_json::json!("symbol")),
+                ("layer", serde_json::json!("file")),
                 ("limit", serde_json::json!(3)),
                 ("threshold", serde_json::json!(0.0)),
+                ("project", serde_json::json!(project_dir.to_string_lossy().to_string()))
             ])),
         )
         .await?;
@@ -109,6 +109,30 @@ async fn mcp_stdio_e2e_index_and_search() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("search result missing text content"))?;
     let search_value: serde_json::Value = serde_json::from_str(search_json)?;
     assert!(search_value.get("query").is_some(), "search json: {search_json}");
+
+    // 第二个工程目录：通过 tool 参数 `project` 路由到独立 registry 项（数据目录按工程隔离）
+    let project_b = unique_temp_dir("semantic-search-mcp-project-b");
+    fs::create_dir_all(&project_b)?;
+    fs::write(project_b.join("lib.rs"), "fn other_crate_fn() {}\n")?;
+
+    let search_b = client
+        .call_tool(
+            CallToolRequestParams::new("search").with_arguments(json_object(&[
+                ("query", serde_json::json!("other_crate_fn")),
+                ("project", serde_json::json!(project_b.to_string_lossy().to_string())),
+                ("layer", serde_json::json!("file")),
+                ("limit", serde_json::json!(3)),
+                ("threshold", serde_json::json!(0.0)),
+            ])),
+        )
+        .await?;
+    let search_b_json = extract_first_text_json(&search_b)
+        .ok_or_else(|| anyhow::anyhow!("search(project_b) missing text"))?;
+    let search_b_value: serde_json::Value = serde_json::from_str(search_b_json)?;
+    assert!(
+        search_b_value.get("project").is_some(),
+        "search with project: {search_b_json}"
+    );
 
     // Graceful shutdown.
     let _reason: QuitReason = client.close().await?;

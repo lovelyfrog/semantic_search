@@ -5,9 +5,8 @@ use std::str::FromStr;
 use lsp_types::Range;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Project {
-    pub id: i64,
     pub root_path: PathBuf,
     pub embedding_model: String,
     pub hash: String,
@@ -16,7 +15,6 @@ pub struct Project {
 
 #[derive(Debug, Clone)]
 pub struct IndexStatus {
-    pub project_id: i64,
     // relative path
     pub file_path: String,
     pub layer: IndexType,

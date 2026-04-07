@@ -68,7 +68,7 @@ impl IndexManager {
 
         let prev_files_status = self
             .storage_manager
-            .get_index_status_by_project(project.id, layer)?;
+            .get_index_status_by_layer(layer)?;
 
         let diff = calculate_diff(&curr_files_status, &prev_files_status);
 
@@ -102,9 +102,9 @@ impl IndexManager {
             layer
         );
         self.storage_manager
-            .delete_index_status_by_project(project.id, layer)?;
+            .delete_index_status_by_layer(layer)?;
         self.storage_manager
-            .delete_chunks_by_project(&project.hash, layer)
+            .delete_layer_table(layer)
             .await?;
         log::info!(
             "deleted project {} from layer {}",
@@ -128,7 +128,7 @@ impl IndexManager {
         for file in files {
             log::info!("deleting file {} from layer {}", file.file_path, layer);
             self.storage_manager
-                .delete_index_status(project.id, &file.file_path, layer)
+                .delete_index_status(&file.file_path, layer)
                 .unwrap_or_else(|e| {
                     log::error!(
                         "failed to delete index status for file {}: {}",
@@ -137,7 +137,7 @@ impl IndexManager {
                     )
                 });
             self.storage_manager
-                .delete_chunks(&project.hash, &file.file_path, layer)
+                .delete_chunks(&file.file_path, layer)
                 .await
                 .unwrap_or_else(|e| {
                     log::error!("failed to delete chunks for file {}: {}", file.file_path, e)
@@ -308,7 +308,6 @@ async fn scan_project(
                 let indexed_at = system_time_to_timestamp(SystemTime::now());
 
                 index_statuses.push(IndexStatus {
-                    project_id: project.id,
                     file_path: relative_path,
                     layer,
                     file_hash,

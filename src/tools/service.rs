@@ -1,10 +1,11 @@
 use std::{
     fmt::Write as _,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use clap::ValueEnum;
 use ort::session::builder::GraphOptimizationLevel;
 use serde::Serialize;
@@ -14,7 +15,7 @@ use crate::{
     embedding::utils::{EmbeddingModelType, EmbeddingOptions, OnnxRuntimeConfig},
     index::utils::{CancelToken, IndexProgress, ProgressReporter, SimpleCancelToken},
     manager::SemanticSearchManager,
-    metrics::{data::IndexMetrics, profiler::IndexProfiler},
+    metrics::profiler::IndexProfiler,
     storage::manager::StorageOptions,
 };
 
@@ -62,17 +63,14 @@ impl LayerSelector {
 }
 
 pub struct ResolvedConfig {
-    pub project: PathBuf,
-    pub storage_options: StorageOptions,
+    /// ONNX Runtime 相关配置。
     pub onnx_runtime_config: OnnxRuntimeConfig,
+    /// 嵌入模型与 tokenizer 配置。
     pub embedding_options: EmbeddingOptions,
+    /// 日志输出格式。
     pub output: OutputFormat,
-}
-
-#[derive(Debug, Clone)]
-pub struct IndexRequest {
-    pub project: String,
-    pub layer: LayerSelector,
+    /// 全局日志文件路径（例如 `${DATA_DIR}/semantic_search/running.log`）。
+    pub log_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -111,33 +109,8 @@ pub enum IndexRunStatus {
     Error,
 }
 
-#[derive(Debug, Serialize)]
-pub struct StartIndexResponse {
-    pub project: String,
-    pub layers: Vec<String>,
-    pub status: IndexRunStatus,
-    pub usage_hint: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct StopIndexResponse {
-    pub project: String,
-    pub status: IndexRunStatus,
-    pub usage_hint: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct IndexProgressResponse {
-    pub project: String,
-    pub status: IndexRunStatus,
-    pub progress: IndexProgress,
-    pub last_error: Option<String>,
-    pub usage_hint: String,
-}
-
 #[async_trait]
 pub trait SemanticSearchBackend: Send + Sync {
-    async fn index_layers(&self, layers: &[IndexType]) -> anyhow::Result<IndexMetrics>;
     async fn start_indexing(&self, layers: &[IndexType]) -> anyhow::Result<IndexRunStatus>;
     async fn index_progress(&self) -> anyhow::Result<IndexProgressResponse>;
     async fn stop_indexing(&self) -> anyhow::Result<IndexRunStatus>;
@@ -186,76 +159,62 @@ struct SessionProgressReporter {
 
 impl ProgressReporter for SessionProgressReporter {
     fn on_progress(&self, progress: IndexProgress) {
-        if let Ok(mut s) = self.session.lock() {
-            s.progress = progress;
-        }
+        let mut s = self.session.lock();
+        s.progress = progress;
     }
 
     fn on_completed(&self) {
-        if let Ok(mut s) = self.session.lock() {
-            s.status = IndexRunStatus::Completed;
-        }
+        let mut s = self.session.lock();
+        s.status = IndexRunStatus::Completed;
     }
 
     fn on_error(&self, error: String) {
-        if let Ok(mut s) = self.session.lock() {
-            s.status = IndexRunStatus::Error;
-            s.last_error = Some(error);
-        }
+        let mut s = self.session.lock();
+        s.status = IndexRunStatus::Error;
+        s.last_error = Some(error);
     }
 }
 
 impl ManagerBackend {
-    pub async fn new(config: &ResolvedConfig) -> anyhow::Result<Self> {
+    /// 基于给定工程根与全局配置创建后端。
+    pub async fn new(
+        project_root: &Path,
+        storage_options: StorageOptions,
+        config: &ResolvedConfig,
+    ) -> anyhow::Result<Self> {
         // This backend is used from binaries that already run inside a Tokio runtime.
         // Creating and dropping a nested runtime can panic during shutdown.
         let handle = tokio::runtime::Handle::current();
         let manager = SemanticSearchManager::new(
-            config.storage_options.clone(),
+            storage_options,
             OnnxRuntimeConfig {
                 runtime_path: config.onnx_runtime_config.runtime_path.clone(),
                 intra_threads: config.onnx_runtime_config.intra_threads,
                 optimization_level: GraphOptimizationLevel::Level1,
             },
             config.embedding_options.clone(),
-            &config.project,
+            project_root,
             handle.clone(),
         )
         .await?;
         Ok(Self {
             manager: Arc::new(manager),
             session: Arc::new(Mutex::new(IndexSession::default())),
-            project: config.project.to_string_lossy().to_string(),
+            project: project_root.to_string_lossy().to_string(),
         })
     }
 }
 
 #[async_trait]
 impl SemanticSearchBackend for ManagerBackend {
-    async fn index_layers(&self, layers: &[IndexType]) -> anyhow::Result<IndexMetrics> {
-        let profiler = Arc::new(IndexProfiler::new(self.manager.storage_options()));
-        prepare_profiler_for_selected_layers(&profiler, layers);
-
-        let progress_reporter: Arc<dyn ProgressReporter> = Arc::new(SilentProgressReporter);
-        let cancel_token: Arc<dyn CancelToken> = Arc::new(SimpleCancelToken::new());
-
-        for layer in layers {
-            self.manager
-                .index_layer(
-                    *layer,
-                    profiler.clone(),
-                    progress_reporter.clone(),
-                    cancel_token.clone(),
-                )
-                .await?;
-        }
-
-        Ok(profiler.stop_profiler())
-    }
-
     async fn start_indexing(&self, layers: &[IndexType]) -> anyhow::Result<IndexRunStatus> {
-        {
-            let mut s = self.session.lock().expect("index session mutex poisoned");
+        let cancel_token: Arc<dyn CancelToken> = {
+            let mut s = self.session.lock();
+            if s.status == IndexRunStatus::Running {
+                anyhow::bail!(
+                    "indexing already in progress for this project; poll index_progress or use stop_index first"
+                );
+            }
             *s = IndexSession {
                 status: IndexRunStatus::Running,
                 progress: IndexProgress {
@@ -267,47 +226,24 @@ impl SemanticSearchBackend for ManagerBackend {
                 last_error: None,
                 cancel_token: Arc::new(SimpleCancelToken::new()),
             };
-        }
+            s.cancel_token.clone()
+        };
 
         let progress_reporter: Arc<dyn ProgressReporter> =
             Arc::new(SessionProgressReporter { session: self.session.clone() });
-        let cancel_token: Arc<dyn CancelToken> = {
-            let s = self.session.lock().expect("index session mutex poisoned");
-            s.cancel_token.clone()
-        };
 
         let profiler = Arc::new(IndexProfiler::new(self.manager.storage_options()));
         prepare_profiler_for_selected_layers(&profiler, layers);
 
-        let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(layers.len()));
         for layer in layers.iter().copied() {
             let manager = self.manager.clone();
             let profiler_clone = profiler.clone();
             let reporter_clone = progress_reporter.clone();
             let cancel_clone = cancel_token.clone();
-            let remaining_clone = remaining.clone();
-            let session_clone = self.session.clone();
             tokio::spawn(async move {
-                let result = manager
+                let _result = manager
                     .index_layer(layer, profiler_clone, reporter_clone.clone(), cancel_clone)
                     .await;
-                match result {
-                    Ok(()) => {
-                        if remaining_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-                            reporter_clone.on_completed();
-                        }
-                    }
-                    Err(e) => {
-                        reporter_clone.on_error(e.to_string());
-                    }
-                }
-
-                // If cancelled, reflect it (best-effort).
-                if let Ok(mut s) = session_clone.lock() {
-                    if s.cancel_token.is_cancelled() && s.status == IndexRunStatus::Running {
-                        s.status = IndexRunStatus::Cancelled;
-                    }
-                }
             });
         }
 
@@ -315,7 +251,7 @@ impl SemanticSearchBackend for ManagerBackend {
     }
 
     async fn index_progress(&self) -> anyhow::Result<IndexProgressResponse> {
-        let guard = self.session.lock().expect("index session mutex poisoned");
+        let guard = self.session.lock();
         Ok(IndexProgressResponse {
             project: self.project.clone(),
             status: guard.status,
@@ -331,7 +267,7 @@ impl SemanticSearchBackend for ManagerBackend {
     }
 
     async fn stop_indexing(&self) -> anyhow::Result<IndexRunStatus> {
-        let mut guard = self.session.lock().expect("index session mutex poisoned");
+        let mut guard = self.session.lock();
         guard.cancel_token.cancel();
         if guard.status == IndexRunStatus::Running {
             guard.status = IndexRunStatus::Cancelled;
@@ -367,183 +303,102 @@ fn prepare_profiler_for_selected_layers(profiler: &Arc<IndexProfiler>, layers: &
     }
 }
 
-struct SilentProgressReporter;
-
-impl ProgressReporter for SilentProgressReporter {
-    fn on_progress(&self, _progress: crate::index::utils::IndexProgress) {}
-    fn on_completed(&self) {}
-    fn on_error(&self, _error: String) {}
+pub async fn dispatch_execute_start_index<B: SemanticSearchBackend + ?Sized>(
+    backend: &B,
+    request: StartIndexRequest,
+) -> anyhow::Result<CommandResponse> {
+    let layers = request.layer.to_layers();
+    let status = backend.start_indexing(&layers).await?;
+    Ok(CommandResponse::StartIndex(StartIndexResponse {
+        project: request.project,
+        layers: layers.iter().map(ToString::to_string).collect(),
+        status,
+        usage_hint: "Use /index_progress to check progress; /stop_index to cancel; /search is available anytime.".to_string(),
+    }))
 }
 
-pub struct CommandHandler<B> {
-    backend: B,
+pub async fn dispatch_execute_index_progress<B: SemanticSearchBackend + ?Sized>(
+    backend: &B,
+    request: IndexProgressRequest,
+) -> anyhow::Result<CommandResponse> {
+    let mut response = backend.index_progress().await?;
+    // 与请求中的工程键对齐（便于多工程 MCP 返回一致路径）
+    response.project = request.project;
+    Ok(CommandResponse::IndexProgress(response))
 }
 
-impl<B> CommandHandler<B> {
-    pub fn new(backend: B) -> Self {
-        Self { backend }
-    }
+pub async fn dispatch_execute_stop_index<B: SemanticSearchBackend + ?Sized>(
+    backend: &B,
+    request: StopIndexRequest,
+) -> anyhow::Result<CommandResponse> {
+    let status = backend.stop_indexing().await?;
+    Ok(CommandResponse::StopIndex(StopIndexResponse {
+        project: request.project,
+        status,
+        usage_hint: "You can restart with /start_index. Searching uses whatever has been indexed so far.".to_string(),
+    }))
 }
 
-impl<B: SemanticSearchBackend> CommandHandler<B> {
-    pub async fn execute_index(&self, request: IndexRequest) -> anyhow::Result<CommandResponse> {
-        let layers = request.layer.to_layers();
-        let metrics = self.backend.index_layers(&layers).await?;
-        Ok(CommandResponse::Index(IndexResponse {
-            project: request.project,
-            layers: layers.iter().map(ToString::to_string).collect(),
-            metrics,
-            usage_hint: "Run /search <query> after indexing; searching during indexing returns whatever has already been indexed.".to_string(),
-        }))
-    }
+pub async fn dispatch_execute_search<B: SemanticSearchBackend + ?Sized>(
+    backend: &B,
+    request: SearchRequest,
+) -> anyhow::Result<CommandResponse> {
+    let layers = request.layer.to_layers();
 
-    pub async fn execute_start_index(
-        &self,
-        request: StartIndexRequest,
-    ) -> anyhow::Result<CommandResponse> {
-        let layers = request.layer.to_layers();
-        let status = self.backend.start_indexing(&layers).await?;
-        Ok(CommandResponse::StartIndex(StartIndexResponse {
-            project: request.project,
-            layers: layers.iter().map(ToString::to_string).collect(),
-            status,
-            usage_hint: "Use /index_progress to check progress; /stop_index to cancel; /search is available anytime.".to_string(),
-        }))
-    }
+    let mut results = backend
+        .search_layers(
+            &request.query,
+            request.limit,
+            request.threshold,
+            &layers,
+            request.paths.clone(),
+        )
+        .await?;
 
-    pub async fn execute_index_progress(
-        &self,
-        _request: IndexProgressRequest,
-    ) -> anyhow::Result<CommandResponse> {
-        let response = self.backend.index_progress().await?;
-        Ok(CommandResponse::IndexProgress(response))
-    }
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(request.limit);
 
-    pub async fn execute_stop_index(&self, request: StopIndexRequest) -> anyhow::Result<CommandResponse> {
-        let status = self.backend.stop_indexing().await?;
-        Ok(CommandResponse::StopIndex(StopIndexResponse {
-            project: request.project,
-            status,
-            usage_hint: "You can restart with /start_index. Searching uses whatever has been indexed so far.".to_string(),
-        }))
-    }
+    let layer_label = match request.layer {
+        LayerSelector::File => "file",
+        LayerSelector::Symbol => "symbol",
+        LayerSelector::Content => "content",
+        LayerSelector::All => "all",
+    };
 
-    pub async fn execute_search(&self, request: SearchRequest) -> anyhow::Result<CommandResponse> {
-        let layers = request.layer.to_layers();
-
-        let mut results = self
-            .backend
-            .search_layers(&request.query, request.limit, request.threshold, &layers, request.paths.clone())
-            .await?;
-
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(request.limit);
-
-        let layer_label = match request.layer {
-            LayerSelector::File => "file",
-            LayerSelector::Symbol => "symbol",
-            LayerSelector::Content => "content",
-            LayerSelector::All => "all",
-        };
-
-        Ok(CommandResponse::Search(SearchResponse {
-            project: request.project,
-            query: request.query,
-            layer: layer_label.to_string(),
-            limit: request.limit,
-            threshold: request.threshold,
-            usage_hint: "If results are missing, run /index first or continue searching while indexing is still in progress.".to_string(),
-            results: results
-                .into_iter()
-                .map(|result| SearchResultView {
-                    score: result.score,
-                    layer: result.info.layer.to_string(),
-                    file_path: result.info.file_path,
-                    lang: result.info.lang,
-                    range: result.info.range.map(RangeView::from),
-                    content: result.info.content,
-                })
-                .collect(),
-        }))
-    }
+    Ok(CommandResponse::Search(SearchResponse {
+        project: request.project,
+        query: request.query,
+        layer: layer_label.to_string(),
+        limit: request.limit,
+        threshold: request.threshold,
+        usage_hint: "If results are missing, run /index first or continue searching while indexing is still in progress.".to_string(),
+        results: results
+            .into_iter()
+            .map(|result| SearchResultView {
+                score: result.score,
+                layer: result.info.layer.to_string(),
+                file_path: result.info.file_path,
+                lang: result.info.lang,
+                range: result.info.range.map(RangeView::from),
+                content: result.info.content,
+            })
+            .collect(),
+    }))
 }
 
 pub enum CommandResponse {
-    Index(IndexResponse),
     StartIndex(StartIndexResponse),
     IndexProgress(IndexProgressResponse),
     StopIndex(StopIndexResponse),
     Search(SearchResponse),
 }
 
-impl CommandResponse {
-    pub fn render(&self, format: OutputFormat) -> anyhow::Result<String> {
-        match format {
-            OutputFormat::Json => match self {
-                Self::Index(response) => serde_json::to_string_pretty(response).map_err(Into::into),
-                Self::StartIndex(response) => serde_json::to_string_pretty(response).map_err(Into::into),
-                Self::IndexProgress(response) => serde_json::to_string_pretty(response).map_err(Into::into),
-                Self::StopIndex(response) => serde_json::to_string_pretty(response).map_err(Into::into),
-                Self::Search(response) => serde_json::to_string_pretty(response).map_err(Into::into),
-            },
-            OutputFormat::Text => Ok(match self {
-                Self::Index(response) => response.render_text(),
-                Self::StartIndex(response) => format!(
-                    "Index started\nproject: {}\nlayers: {}\nstatus: {:?}\nnext: {}",
-                    response.project,
-                    response.layers.join(", "),
-                    response.status,
-                    response.usage_hint
-                ),
-                Self::IndexProgress(response) => format!(
-                    "Index progress\nproject: {}\nstatus: {:?}\nhandled: {} files, {} symbols\ntotal: {} files, {} symbols\nnext: {}",
-                    response.project,
-                    response.status,
-                    response.progress.handled_file_count,
-                    response.progress.handled_symbol_count,
-                    response.progress.total_file_count,
-                    response.progress.total_symbol_count,
-                    response.usage_hint
-                ),
-                Self::StopIndex(response) => format!(
-                    "Index stopped\nproject: {}\nstatus: {:?}\nnext: {}",
-                    response.project,
-                    response.status,
-                    response.usage_hint
-                ),
-                Self::Search(response) => response.render_text(),
-            }),
-        }
-    }
-}
-
 #[derive(Debug, Serialize)]
-pub struct IndexResponse {
+pub struct StartIndexResponse {
     pub project: String,
     pub layers: Vec<String>,
-    pub metrics: IndexMetrics,
+    pub status: IndexRunStatus,
     pub usage_hint: String,
-}
-
-impl IndexResponse {
-    fn render_text(&self) -> String {
-        let mut out = String::new();
-        let _ = writeln!(&mut out, "Index completed");
-        let _ = writeln!(&mut out, "project: {}", self.project);
-        let _ = writeln!(&mut out, "layers: {}", self.layers.join(", "));
-        let _ = writeln!(
-            &mut out,
-            "handled: {} files, {} symbols",
-            self.metrics.handled_file_count, self.metrics.handled_symbol_count
-        );
-        let _ = writeln!(
-            &mut out,
-            "duration: {:.2}s",
-            self.metrics.total_time.as_secs_f64()
-        );
-        let _ = writeln!(&mut out, "next: {}", self.usage_hint);
-        out.trim_end().to_string()
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -592,6 +447,61 @@ impl SearchResponse {
         }
         let _ = writeln!(&mut out, "next: {}", self.usage_hint);
         out.trim_end().to_string()
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct StopIndexResponse {
+    pub project: String,
+    pub status: IndexRunStatus,
+    pub usage_hint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IndexProgressResponse {
+    pub project: String,
+    pub status: IndexRunStatus,
+    pub progress: IndexProgress,
+    pub last_error: Option<String>,
+    pub usage_hint: String,
+}
+
+impl CommandResponse {
+    pub fn render(&self, format: OutputFormat) -> anyhow::Result<String> {
+        match format {
+            OutputFormat::Json => match self {
+                Self::StartIndex(response) => serde_json::to_string_pretty(response).map_err(Into::into),
+                Self::IndexProgress(response) => serde_json::to_string_pretty(response).map_err(Into::into),
+                Self::StopIndex(response) => serde_json::to_string_pretty(response).map_err(Into::into),
+                Self::Search(response) => serde_json::to_string_pretty(response).map_err(Into::into),
+            },
+            OutputFormat::Text => Ok(match self {
+                Self::StartIndex(response) => format!(
+                    "Index started\nproject: {}\nlayers: {}\nstatus: {:?}\nnext: {}",
+                    response.project,
+                    response.layers.join(", "),
+                    response.status,
+                    response.usage_hint
+                ),
+                Self::IndexProgress(response) => format!(
+                    "Index progress\nproject: {}\nstatus: {:?}\nhandled: {} files, {} symbols\ntotal: {} files, {} symbols\nnext: {}",
+                    response.project,
+                    response.status,
+                    response.progress.handled_file_count,
+                    response.progress.handled_symbol_count,
+                    response.progress.total_file_count,
+                    response.progress.total_symbol_count,
+                    response.usage_hint
+                ),
+                Self::StopIndex(response) => format!(
+                    "Index stopped\nproject: {}\nstatus: {:?}\nnext: {}",
+                    response.project,
+                    response.status,
+                    response.usage_hint
+                ),
+                Self::Search(response) => response.render_text(),
+            }),
+        }
     }
 }
 

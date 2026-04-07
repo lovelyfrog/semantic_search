@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::common::data::{Chunk, ChunkInfo, IndexType, QueryResult};
 
-/// Placeholder for a LanceDB-backed vector store; wire [`lancedb`] APIs here.
+/// LanceDB vector store for a **single** project (one DB directory per codebase).
 pub struct LancedbChunkStore {
     conn: Connection,
     schema: SchemaRef,
@@ -24,6 +24,7 @@ pub struct LancedbChunkStore {
 impl LancedbChunkStore {
     pub async fn open(db_path: &Path, dim: i32) -> Result<Self> {
         let uri = db_path.to_string_lossy();
+        log::info!("Connecting to LanceDB at {}", uri);
         let conn = connect(&uri).execute().await?;
 
         let schema = Schema::new(vec![
@@ -45,14 +46,26 @@ impl LancedbChunkStore {
         })
     }
 
-    pub async fn get_or_create_table(&self, identifier: &str, layer: IndexType) -> Result<Table> {
-        let table_name = format!("{}_{}", layer.to_string(), identifier);
+    fn table_name(layer: IndexType) -> String {
+        layer.to_string()
+    }
+
+    pub async fn get_table(&self, layer: IndexType) -> Result<Table> {
+        let table_name = Self::table_name(layer);
+        let table = self.conn.open_table(&table_name).execute().await?;
+        Ok(table)
+    }
+
+    pub async fn get_or_create_table(&self, layer: IndexType) -> Result<Table> {
+        let table_name = Self::table_name(layer);
         let table = self.conn.table_names().execute().await?;
 
         if table.contains(&table_name) {
+            log::info!("Table {} already exists", table_name);
             let table = self.conn.open_table(&table_name).execute().await?;
             Ok(table)
         } else {
+            log::info!("Creating table {}", table_name);
             let table = self
                 .conn
                 .create_empty_table(&table_name, self.schema.clone())
@@ -62,13 +75,8 @@ impl LancedbChunkStore {
         }
     }
 
-    pub async fn append_chunks(
-        &self,
-        identifier: &str,
-        layer: IndexType,
-        chunks: Vec<Chunk>,
-    ) -> Result<()> {
-        let table = self.get_or_create_table(identifier, layer).await?;
+    pub async fn append_chunks(&self, layer: IndexType, chunks: Vec<Chunk>) -> Result<()> {
+        let table = self.get_or_create_table(layer).await?;
 
         let mut ids = Vec::new();
         let mut layers = Vec::new();
@@ -120,14 +128,21 @@ impl LancedbChunkStore {
 
     pub async fn search(
         &self,
-        identifier: &str,
         query_vector: Vec<f32>,
         limit: usize,
         threshold: f32,
         layer: IndexType,
         paths: Vec<String>,
     ) -> Result<Vec<QueryResult>> {
-        let table = self.get_or_create_table(identifier, layer).await?;
+        log::info!("Searching for {} chunks in {}", limit, layer);
+
+        let table = match self.get_table(layer).await {
+            Ok(table) => table,
+            Err(err) => {
+                log::error!("Failed to open table: {}", err);
+                return Ok(Vec::new());
+            }
+        };
 
         let mut search = table
             .query()
@@ -177,17 +192,15 @@ impl LancedbChunkStore {
 
     pub async fn delete_chunks_by_path(
         &self,
-        identifier: &str,
         file_path: &str,
         layer: IndexType,
     ) -> Result<()> {
-        self.delete_chunks_by_paths(identifier, vec![file_path.to_string()], layer)
+        self.delete_chunks_by_paths(vec![file_path.to_string()], layer)
             .await
     }
 
     pub async fn delete_chunks_by_paths(
         &self,
-        identifier: &str,
         paths: Vec<String>,
         layer: IndexType,
     ) -> Result<()> {
@@ -195,7 +208,7 @@ impl LancedbChunkStore {
             return Ok(());
         }
 
-        let table = self.get_or_create_table(identifier, layer).await?;
+        let table = self.get_or_create_table(layer).await?;
         if let Some(filter) = construct_filter(&paths) {
             table.delete(&filter).await?;
         }
@@ -203,8 +216,8 @@ impl LancedbChunkStore {
         Ok(())
     }
 
-    pub async fn delete_table(&self, identifier: &str, layer: IndexType) -> Result<()> {
-        let table_name = format!("{}_{}", layer.to_string(), identifier);
+    pub async fn delete_table(&self, layer: IndexType) -> Result<()> {
+        let table_name = Self::table_name(layer);
         let tables = self.conn.table_names().execute().await?;
         if tables.contains(&table_name) {
             self.conn.drop_table(&table_name).await?;
@@ -233,106 +246,106 @@ fn construct_filter(paths: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use crate::test::utils::temp_dir;
-    use anyhow;
-    use std::str::FromStr;
-    use tokio;
 
     use super::*;
+    use crate::common::data::{Chunk, ChunkInfo, IndexType};
 
-    fn make_dummy_chunk(layer: &str, file_path: &str, embedding: Vec<f32>) -> Chunk {
-        Chunk {
-            embedding_content: "dummy".to_string(),
-            info: ChunkInfo {
-                file_path: file_path.to_string(),
-                layer: IndexType::from_str(layer).unwrap(),
-                lang: "rust".to_string(),
-                content: Some("dummy content".to_string()),
-                range: None,
-            },
-            embedding,
-            ..Default::default()
-        }
-    }
-
-    async fn setup_table(identifier: &str) -> Result<LancedbChunkStore> {
+    async fn setup_table() -> Result<LancedbChunkStore> {
         let dir = temp_dir().join(format!("vectordb_{}", uuid::Uuid::new_v4()));
         let db = LancedbChunkStore::open(&dir, 2).await?;
 
-        db.delete_table(identifier, IndexType::File).await?;
-        db.delete_table(identifier, IndexType::Symbol).await?;
+        db.delete_table(IndexType::File).await?;
+        db.delete_table(IndexType::Symbol).await?;
 
-        db.get_or_create_table(identifier, IndexType::File).await?;
-        db.get_or_create_table(identifier, IndexType::Symbol)
-            .await?;
-
-        let file_chunks = vec![
-            make_dummy_chunk("file", "src/main.rs", vec![0.1, 0.2]),
-            make_dummy_chunk("file", "src/lib.rs", vec![0.4, 0.5]),
-        ];
-        db.append_chunks(identifier, IndexType::File, file_chunks)
-            .await?;
-
-        let symbol_chunks = vec![
-            make_dummy_chunk("symbol", "src/main.rs", vec![0.9, 0.9]),
-            make_dummy_chunk("symbol", "src/main.rs", vec![0.8, 0.8]),
-            make_dummy_chunk("symbol", "src/lib.rs", vec![0.3, 0.4]),
-            make_dummy_chunk("symbol", "src/lib.rs", vec![0.3, 0.3]),
-            make_dummy_chunk("symbol", "src/lib.rs", vec![0.4, 0.3]),
-        ];
-        db.append_chunks(identifier, IndexType::Symbol, symbol_chunks)
-            .await?;
-
+        db.get_or_create_table(IndexType::File).await?;
+        db.get_or_create_table(IndexType::Symbol).await?;
         Ok(db)
     }
 
     #[tokio::test]
-    async fn test_search_layer_filer() -> anyhow::Result<()> {
-        let identifier = "chunks";
-        let db = setup_table(identifier).await?;
+    async fn test_delete_chunks() -> anyhow::Result<()> {
+        let db = setup_table().await?;
+
+        let file_chunks = vec![
+            Chunk {
+                embedding_content: String::new(),
+                embedding: vec![1.0, 0.0],
+                info: ChunkInfo {
+                    layer: IndexType::File,
+                    file_path: "src/lib.rs".to_string(),
+                    lang: "rust".to_string(),
+                    range: None,
+                    content: None,
+                },
+                is_last: false,
+            },
+            Chunk {
+                embedding_content: String::new(),
+                embedding: vec![0.0, 1.0],
+                info: ChunkInfo {
+                    layer: IndexType::File,
+                    file_path: "src/main.rs".to_string(),
+                    lang: "rust".to_string(),
+                    range: None,
+                    content: None,
+                },
+                is_last: false,
+            },
+        ];
+
+        db.append_chunks(IndexType::File, file_chunks).await?;
+
+        db.delete_chunks_by_path("src/lib.rs", IndexType::File)
+            .await?;
 
         let results = db
             .search(
-                identifier,
-                vec![0.3, 0.4],
+                vec![1.0, 0.0],
                 10,
                 0.0,
-                IndexType::Symbol,
+                IndexType::File,
                 vec![],
             )
             .await?;
 
-        assert_eq!(results.len(), 5);
-        assert_eq!(results[0].info.file_path, "src/lib.rs");
-        assert_eq!(results[0].info.layer, IndexType::Symbol);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].info.file_path, "src/main.rs");
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_delete_chunks() -> anyhow::Result<()> {
-        let identifier = "chunks";
-        let db = setup_table(identifier).await?;
+    async fn test_search_layer_filer() -> anyhow::Result<()> {
+        let db = setup_table().await?;
 
-        let layers = vec![IndexType::Symbol, IndexType::File];
-        for layer in layers {
-            db.delete_chunks_by_path(identifier, "src/lib.rs", layer)
-                .await?;
-        }
+        let symbol_chunks = vec![Chunk {
+            embedding_content: String::new(),
+            embedding: vec![1.0, 0.0],
+            info: ChunkInfo {
+                layer: IndexType::Symbol,
+                file_path: "src/lib.rs".to_string(),
+                lang: "rust".to_string(),
+                range: None,
+                content: None,
+            },
+            is_last: false,
+        }];
+
+        db.append_chunks(IndexType::Symbol, symbol_chunks).await?;
 
         let results = db
             .search(
-                identifier,
-                vec![0.3, 0.4],
+                vec![1.0, 0.0],
                 10,
                 0.0,
                 IndexType::Symbol,
-                vec![],
+                vec!["src/lib.rs".to_string()],
             )
             .await?;
 
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].info.file_path, "src/main.rs");
-        assert_eq!(results[0].info.layer, IndexType::Symbol);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].info.file_path, "src/lib.rs");
+
         Ok(())
     }
 }

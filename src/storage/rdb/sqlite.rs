@@ -6,13 +6,14 @@ use std::{
 };
 
 use rusqlite::types::Type;
-use rusqlite::{Connection, Params, Result, params};
+use rusqlite::{Connection, Result, params};
 
 use crate::common::{
     data::{IndexStatus, IndexType, Project},
     utils::hash_str,
 };
 
+/// SQLite 索引元数据：一个 `index.db` 只对应一个工程；不在此结构体上缓存 [`Project`]。
 pub struct IndexStatusStore {
     db_path: PathBuf,
 }
@@ -21,9 +22,7 @@ impl IndexStatusStore {
     pub fn new(db_path: PathBuf) -> Self {
         Self { db_path }
     }
-}
 
-impl IndexStatusStore {
     pub fn open(&self) -> Result<Connection> {
         let conn = Connection::open(self.db_path.as_path())?;
         conn.execute_batch(include_str!("schema.sql"))?;
@@ -38,7 +37,7 @@ impl IndexStatusStore {
 
         let conn = self.open()?;
         let mut stmt = conn.prepare(
-            "SELECT id, root_path, embedding_model, hash, index_finished_time FROM projects 
+            "SELECT root_path, embedding_model, hash, index_finished_time FROM projects 
             WHERE root_path = ?1 AND embedding_model = ?2",
         )?;
 
@@ -46,11 +45,10 @@ impl IndexStatusStore {
 
         if let Some(row) = rows.next()? {
             Ok(Some(Project {
-                id: row.get(0)?,
-                root_path: PathBuf::from(row.get::<_, String>(1)?),
-                embedding_model: row.get(2)?,
-                hash: row.get(3)?,
-                index_finished_time: Some(row.get(4)?),
+                root_path: PathBuf::from(row.get::<_, String>(0)?),
+                embedding_model: row.get(1)?,
+                hash: row.get(2)?,
+                index_finished_time: Some(row.get(3)?),
             }))
         } else {
             Ok(None)
@@ -73,6 +71,20 @@ impl IndexStatusStore {
 
         let conn = self.open()?;
 
+        // One project row per database file.
+        let mut stmt = conn.prepare("SELECT root_path, embedding_model FROM projects LIMIT 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let existing_root: String = row.get(0)?;
+            let existing_model: String = row.get(1)?;
+            if existing_root != root_str.as_ref() || existing_model != embedding_model {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+                    Some("this index database is already bound to another project".into()),
+                ));
+            }
+        }
+
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::from_secs(0))
@@ -90,9 +102,7 @@ impl IndexStatusStore {
             created_at
         ])?;
 
-        let project_id = conn.last_insert_rowid();
         let project = Project {
-            id: project_id,
             root_path: root_path.to_path_buf(),
             embedding_model: embedding_model.to_string(),
             hash,
@@ -108,72 +118,64 @@ impl IndexStatusStore {
         let root_str = root_canon.to_string_lossy();
 
         let conn = self.open()?;
+        conn.execute("DELETE FROM index_status", [])?;
         let mut stmt =
             conn.prepare("DELETE FROM projects WHERE root_path = ?1 AND embedding_model = ?2")?;
         stmt.execute(params![root_str.as_ref(), embedding_model])?;
         Ok(())
     }
 
-    pub fn delete_project_by_id(&self, project_id: i64) -> Result<()> {
-        let conn = self.open()?;
-        let mut stmt = conn.prepare("DELETE FROM projects WHERE id = ?1")?;
-        stmt.execute(params![project_id])?;
-        Ok(())
-    }
-
+    /// 测试用：清空本库内 `index_status` 与 `projects`。
     fn delete_all_projects(&self) -> Result<()> {
         let conn = self.open()?;
+        conn.execute("DELETE FROM index_status", [])?;
         let mut stmt = conn.prepare("DELETE FROM projects")?;
         stmt.execute(params![])?;
         Ok(())
     }
 
-    pub fn update_project(&self, project_id: i64, index_finished_time: u64) -> Result<()> {
+    /// 单库至多一行工程元数据：更新 `index_finished_time`。
+    pub fn update_project_index_finished_time(&self, index_finished_time: u64) -> Result<()> {
         let conn = self.open()?;
-        let mut stmt =
-            conn.prepare("UPDATE projects SET index_finished_time = ?1 WHERE id = ?2")?;
-        stmt.execute(params![index_finished_time, project_id])?;
+        let mut stmt = conn.prepare("UPDATE projects SET index_finished_time = ?1")?;
+        stmt.execute(params![index_finished_time])?;
         Ok(())
     }
 
-    pub fn get_project_index_finished_time(&self, project_id: i64) -> Result<Option<u64>> {
+    /// 读取本库 `projects` 首行的完成时间（无行则 `None`）。
+    pub fn get_project_index_finished_time(&self) -> Result<Option<u64>> {
         let conn = self.open()?;
-        let mut stmt = conn.prepare("SELECT index_finished_time FROM projects WHERE id = ?1")?;
-        let mut rows = stmt.query(params![project_id])?;
+        let mut stmt = conn.prepare("SELECT index_finished_time FROM projects LIMIT 1")?;
+        let mut rows = stmt.query([])?;
         if let Some(row) = rows.next()? {
-            Ok(row.get(0)?)
+            Ok(Some(row.get(0)?))
         } else {
             Ok(None)
         }
     }
 
-    pub fn get_index_status_by_project(
-        &self,
-        project_id: i64,
-        layer: IndexType,
-    ) -> Result<Vec<IndexStatus>> {
+    pub fn get_index_status_by_layer(&self, layer: IndexType) -> Result<Vec<IndexStatus>> {
         let conn = self.open()?;
         let mut stmt = conn.prepare(
-            "SELECT project_id, file_path, layer, file_hash, mtime, ctime, size, indexed_at 
+            "SELECT file_path, layer, file_hash, mtime, ctime, size, indexed_at 
             FROM index_status 
-            WHERE project_id = ?1 AND layer = ?2",
+            WHERE layer = ?1",
         )?;
-        let mut rows = stmt.query_map(params![project_id, layer.to_string()], |row| {
+        let mut rows = stmt.query_map(params![layer.to_string()], |row| {
             Ok(IndexStatus {
-                project_id: row.get(0)?,
-                file_path: row.get(1)?,
-                layer: IndexType::from_str(row.get::<_, String>(2)?.as_str()).map_err(|e| {
+                file_path: row.get(0)?,
+                layer: IndexType::from_str(row.get::<_, String>(1)?.as_str()).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        2,
+                        1,
                         Type::Text,
                         Box::new(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
                     )
                 })?,
-                file_hash: row.get(3)?,
-                mtime: row.get(4)?,
-                ctime: row.get(5)?,
-                size: row.get(6)?,
-                indexed_at: row.get(7)?,
+                file_hash: row.get(2)?,
+                mtime: row.get(3)?,
+                ctime: row.get(4)?,
+                size: row.get(5)?,
+                indexed_at: row.get(6)?,
             })
         })?;
 
@@ -186,35 +188,31 @@ impl IndexStatusStore {
 
     pub fn get_index_status_by_path(
         &self,
-        project_id: i64,
         file_path: &str,
         layer: IndexType,
     ) -> Result<Option<IndexStatus>> {
         let conn = self.open()?;
         let mut stmt = conn.prepare(
-            "SELECT project_id, file_path, layer, file_hash, mtime, ctime, size, indexed_at 
+            "SELECT file_path, layer, file_hash, mtime, ctime, size, indexed_at 
             FROM index_status 
-            WHERE project_id = ?1 
-                AND file_path = ?2 
-                AND layer = ?3",
+            WHERE file_path = ?1 AND layer = ?2",
         )?;
-        let mut rows = stmt.query(params![project_id, file_path, layer.to_string()])?;
+        let mut rows = stmt.query(params![file_path, layer.to_string()])?;
         if let Some(row) = rows.next()? {
             Ok(Some(IndexStatus {
-                project_id: row.get(0)?,
-                file_path: row.get(1)?,
-                layer: IndexType::from_str(row.get::<_, String>(2)?.as_str()).map_err(|e| {
+                file_path: row.get(0)?,
+                layer: IndexType::from_str(row.get::<_, String>(1)?.as_str()).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        2,
+                        1,
                         Type::Text,
                         Box::new(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
                     )
                 })?,
-                file_hash: row.get(3)?,
-                mtime: row.get(4)?,
-                ctime: row.get(5)?,
-                size: row.get(6)?,
-                indexed_at: row.get(7)?,
+                file_hash: row.get(2)?,
+                mtime: row.get(3)?,
+                ctime: row.get(4)?,
+                size: row.get(5)?,
+                indexed_at: row.get(6)?,
             }))
         } else {
             Ok(None)
@@ -224,9 +222,9 @@ impl IndexStatusStore {
     pub fn upsert_index_status(&self, index_status: &IndexStatus) -> Result<()> {
         let conn = self.open()?;
         let mut stmt = conn.prepare(
-            "INSERT INTO index_status (project_id, file_path, layer, file_hash, mtime, ctime, size, indexed_at) 
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) 
-            ON CONFLICT (project_id, file_path, layer) 
+            "INSERT INTO index_status (file_path, layer, file_hash, mtime, ctime, size, indexed_at) 
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) 
+            ON CONFLICT (file_path, layer) 
             DO UPDATE SET 
                 file_hash = excluded.file_hash, 
                 mtime = excluded.mtime, 
@@ -235,7 +233,6 @@ impl IndexStatusStore {
                 indexed_at = excluded.indexed_at"
         )?;
         stmt.execute(params![
-            index_status.project_id,
             index_status.file_path,
             index_status.layer.to_string(),
             index_status.file_hash,
@@ -247,25 +244,22 @@ impl IndexStatusStore {
         Ok(())
     }
 
-    pub fn delete_index_status_by_project(&self, project_id: i64, layer: IndexType) -> Result<()> {
+    pub fn delete_index_status_by_layer(&self, layer: IndexType) -> Result<()> {
         let conn = self.open()?;
-        let mut stmt =
-            conn.prepare("DELETE FROM index_status WHERE project_id = ?1 AND layer = ?2")?;
-        stmt.execute(params![project_id, layer.to_string()])?;
+        let mut stmt = conn.prepare("DELETE FROM index_status WHERE layer = ?1")?;
+        stmt.execute(params![layer.to_string()])?;
         Ok(())
     }
 
     pub fn delete_index_status_by_path(
         &self,
-        project_id: i64,
         file_path: &str,
         layer: IndexType,
     ) -> Result<()> {
         let conn = self.open()?;
-        let mut stmt = conn.prepare(
-            "DELETE FROM index_status WHERE project_id = ?1 AND file_path = ?2 AND layer = ?3",
-        )?;
-        stmt.execute(params![project_id, file_path, layer.to_string()])?;
+        let mut stmt =
+            conn.prepare("DELETE FROM index_status WHERE file_path = ?1 AND layer = ?2")?;
+        stmt.execute(params![file_path, layer.to_string()])?;
         Ok(())
     }
 }
@@ -275,6 +269,7 @@ mod tests {
     use crate::test::utils::temp_dir;
 
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn now() -> u64 {
         SystemTime::now()
@@ -285,17 +280,20 @@ mod tests {
 
     fn setup_store() -> IndexStatusStore {
         let db_path = temp_dir().join(format!("db/test_{}.db", uuid::Uuid::new_v4()));
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).expect("create db parent dir for tests");
+        }
         IndexStatusStore::new(db_path)
     }
+
     #[test]
     fn test_create_project() {
-        let store = setup_store();
         let project_path1 = temp_dir().join("projects/hmosworld/commons/aspect");
         let project_path2 = temp_dir().join("projects/hmosworld/commons/audioplayer");
-        let project1 = store.get_or_create_project(&project_path1, "veso").unwrap();
-        let project2 = store.get_or_create_project(&project_path2, "veso").unwrap();
-        assert_eq!(project1.id, 1);
-        assert_eq!(project2.id, 2);
+        let store1 = setup_store();
+        let store2 = setup_store();
+        let project1 = store1.get_or_create_project(&project_path1, "veso").unwrap();
+        let project2 = store2.get_or_create_project(&project_path2, "veso").unwrap();
         assert_eq!(project1.root_path, project_path1);
         assert_eq!(project2.root_path, project_path2);
         assert_eq!(project1.embedding_model, "veso");
@@ -303,12 +301,11 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_project_by_id() {
+    fn test_delete_project_clears_row() {
         let store = setup_store();
         let project_path = temp_dir().join("projects/hmosworld/commons/aspect");
-        let project = store.get_or_create_project(&project_path, "veso").unwrap();
-        assert_eq!(project.id, 1);
-        store.delete_project_by_id(project.id).unwrap();
+        store.get_or_create_project(&project_path, "veso").unwrap();
+        store.delete_project(&project_path, "veso").unwrap();
         let project = store.get_project(&project_path, "veso").unwrap();
         assert!(project.is_none());
     }
@@ -317,8 +314,7 @@ mod tests {
     fn test_delete_project_by_path() {
         let store = setup_store();
         let project_path = temp_dir().join("projects/hmosworld/commons/aspect");
-        let project = store.get_or_create_project(&project_path, "veso").unwrap();
-        assert_eq!(project.id, 1);
+        store.get_or_create_project(&project_path, "veso").unwrap();
         store.delete_project(&project_path, "veso").unwrap();
         let project = store.get_project(&project_path, "veso").unwrap();
         assert!(project.is_none());
@@ -329,11 +325,12 @@ mod tests {
         let store = setup_store();
         let project_path1 = temp_dir().join("projects/hmosworld/commons/aspect");
         let project_path2 = temp_dir().join("projects/hmosworld/commons/audioplayer");
-        let project1 = store.get_or_create_project(&project_path1, "veso").unwrap();
-        let project2 = store.get_or_create_project(&project_path2, "veso").unwrap();
+        store.get_or_create_project(&project_path1, "veso").unwrap();
         store.delete_all_projects().unwrap();
         let project1 = store.get_project(&project_path1, "veso").unwrap();
         assert!(project1.is_none());
+        store.get_or_create_project(&project_path2, "veso").unwrap();
+        store.delete_all_projects().unwrap();
         let project2 = store.get_project(&project_path2, "veso").unwrap();
         assert!(project2.is_none());
     }
@@ -342,9 +339,8 @@ mod tests {
     fn test_insert_and_delete_project_index_status() {
         let store = setup_store();
         let project_path = temp_dir().join("projects/hmosworld/commons/aspect");
-        let project = store.get_or_create_project(&project_path, "veso").unwrap();
+        store.get_or_create_project(&project_path, "veso").unwrap();
         let index_status = IndexStatus {
-            project_id: project.id,
             file_path: "test.txt".to_string(),
             layer: IndexType::File,
             file_hash: "test".to_string(),
@@ -354,20 +350,14 @@ mod tests {
             indexed_at: now(),
         };
         store.upsert_index_status(&index_status).unwrap();
-        let index_status = store
-            .get_index_status_by_project(project.id, IndexType::File)
-            .unwrap();
+        let index_status = store.get_index_status_by_layer(IndexType::File).unwrap();
         assert_eq!(index_status.len(), 1);
         assert_eq!(index_status[0].file_path, "test.txt");
         assert_eq!(index_status[0].layer, IndexType::File);
         assert_eq!(index_status[0].file_hash, "test");
-        assert_eq!(index_status[0].mtime, now());
-        assert_eq!(index_status[0].ctime, now());
 
-        store.delete_project_by_id(project.id).unwrap();
-        let index_status = store
-            .get_index_status_by_project(project.id, IndexType::File)
-            .unwrap();
+        store.delete_project(&project_path, "veso").unwrap();
+        let index_status = store.get_index_status_by_layer(IndexType::File).unwrap();
         assert!(index_status.is_empty());
     }
 
@@ -377,7 +367,7 @@ mod tests {
         let project_path = temp_dir().join("projects/hmosworld/commons/aspect");
         let project = store.get_or_create_project(&project_path, "veso").unwrap();
         assert_eq!(project.index_finished_time, None);
-        store.update_project(project.id, 64).unwrap();
+        store.update_project_index_finished_time(64).unwrap();
         let project = store.get_project(&project_path, "veso").unwrap();
         assert!(project.is_some());
         assert_eq!(project.unwrap().index_finished_time, Some(64));
@@ -389,7 +379,6 @@ mod tests {
         let project_path = temp_dir().join("projects/hmosworld/commons/aspect");
         let project = store.get_or_create_project(&project_path, "veso").unwrap();
         let index_status = IndexStatus {
-            project_id: project.id,
             file_path: "test.txt".to_string(),
             layer: IndexType::File,
             file_hash: "test".to_string(),
@@ -400,21 +389,21 @@ mod tests {
         };
         store.upsert_index_status(&index_status).unwrap();
         store
-            .delete_index_status_by_path(project.id, &index_status.file_path, IndexType::File)
+            .delete_index_status_by_path(&index_status.file_path, IndexType::File)
             .unwrap();
         let index_status = store
-            .get_index_status_by_path(project.id, &index_status.file_path, IndexType::File)
+            .get_index_status_by_path(&index_status.file_path, IndexType::File)
             .unwrap();
         assert!(index_status.is_none());
+        let _ = project;
     }
 
     #[test]
     fn test_upsert_update() {
         let store = setup_store();
         let project_path = temp_dir().join("projects/hmosworld/commons/aspect");
-        let project = store.get_or_create_project(&project_path, "veso").unwrap();
+        store.get_or_create_project(&project_path, "veso").unwrap();
         let index_status = IndexStatus {
-            project_id: project.id,
             file_path: "test.txt".to_string(),
             layer: IndexType::File,
             file_hash: "test".to_string(),
@@ -425,12 +414,11 @@ mod tests {
         };
         store.upsert_index_status(&index_status).unwrap();
         let index_status = store
-            .get_index_status_by_path(project.id, &index_status.file_path, IndexType::File)
+            .get_index_status_by_path(&index_status.file_path, IndexType::File)
             .unwrap();
         assert!(index_status.is_some());
         assert_eq!(index_status.unwrap().file_hash, "test");
         let index_status = IndexStatus {
-            project_id: project.id,
             file_path: "test.txt".to_string(),
             layer: IndexType::File,
             file_hash: "test2".to_string(),
@@ -441,7 +429,7 @@ mod tests {
         };
         store.upsert_index_status(&index_status).unwrap();
         let index_status = store
-            .get_index_status_by_path(project.id, &index_status.file_path, IndexType::File)
+            .get_index_status_by_path(&index_status.file_path, IndexType::File)
             .unwrap();
         assert!(index_status.is_some());
         assert_eq!(index_status.unwrap().file_hash, "test2");

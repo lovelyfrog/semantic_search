@@ -21,12 +21,13 @@ export SEMANTIC_SEARCH_OUTPUT=json
 ```
 
 说明：
-- `SEMANTIC_SEARCH_INDEX_DB` / `SEMANTIC_SEARCH_VECTOR_DB` / `SEMANTIC_SEARCH_LOG_PATH` 是可选项；当不设置时，使用平台默认数据目录 `${DATA_DIR}/semantic_search/`：
-  - `index_db_path`: `${DATA_DIR}/semantic_search/index.db`
-  - `vector_db_path`: `${DATA_DIR}/semantic_search/vectordb`
-  - `log_path`: `${DATA_DIR}/semantic_search/running.log`
-  - macOS: `~/Library/Application Support`
-  - Windows: `%APPDATA%`
+- `SEMANTIC_SEARCH_INDEX_DB` / `SEMANTIC_SEARCH_VECTOR_DB` 是可选项；当不设置时，数据按 **工程根目录** 隔离到平台数据目录下的子目录（与旧版「全局单库」路径不兼容，升级后需 **重新索引**）：
+  - 目录名：`${DATA_DIR}/semantic_search/{工程根目录名_经安全化}_{规范化路径的 16 位 hex 哈希}/`
+  - `index_db_path`: 上述目录下的 `index.db`
+  - `vector_db_path`: 上述目录下的 `vectordb/`
+  - 日志：默认写入 `${DATA_DIR}/semantic_search/running.log`，可通过 `SEMANTIC_SEARCH_LOG_PATH` 覆盖
+  - macOS: `DATA_DIR` 通常为 `~/Library/Application Support`
+  - Windows: `DATA_DIR` 通常为 `%APPDATA%`
   - Linux: 暂不考虑
 - `SEMANTIC_SEARCH_ONNX_RUNTIME` / `SEMANTIC_SEARCH_MODEL` / `SEMANTIC_SEARCH_TOKENIZER` 是可选项；当不设置时，会使用仓库内内置 `resources/` 默认资源（按当前平台与 `SEMANTIC_SEARCH_MODEL_TYPE` 选择）。
 - 如需改用非仓库内资源目录，请设置 `SEMANTIC_SEARCH_RESOURCES_DIR`。
@@ -42,45 +43,49 @@ export SEMANTIC_SEARCH_OUTPUT=json
 
 如果产品支持 MCP，推荐直接接入 `semantic-search-mcp`。
 
-当前提供两个 MCP tools：
+当前提供的主要 MCP tools：
 
-- `index`
+- `start_index`
+- `index_progress`
+- `stop_index`
 - `search`
 
 推荐传输方式：
 
 - `stdio`
 
-启动示例：
+启动示例（推荐通过环境变量提供工程路径与可选资源路径）：
 
 ```bash
-semantic-search-mcp \
-  --project /workspace/repo \
-  --index-db-path /workspace/repo/.semantic/index.db \
-  --vector-db-path /workspace/repo/.semantic/lancedb \
-  --onnx-runtime-path /models/onnxruntime.dylib \
-  --model-path /models/model.onnx \
-  --tokenizer-path /models/tokenizer.json
-```
+export SEMANTIC_SEARCH_PROJECT=/workspace/repo
+export SEMANTIC_SEARCH_ONNX_RUNTIME=/models/onnxruntime.dylib
+export SEMANTIC_SEARCH_MODEL=/models/model.onnx
+export SEMANTIC_SEARCH_TOKENIZER=/models/tokenizer.json
 
-如果共享配置已经通过环境变量注入，则可以直接启动：
-
-```bash
 semantic-search-mcp
 ```
 
+说明：
+
+- `SEMANTIC_SEARCH_PROJECT` 在 **未**在 tool 请求中显式传入 `project` 字段时，作为默认工程根。
+- `SEMANTIC_SEARCH_INDEX_DB` / `SEMANTIC_SEARCH_VECTOR_DB` / `SEMANTIC_SEARCH_LOG_PATH` 为可选项；当设置且当前工程的规范化键与 `SEMANTIC_SEARCH_PROJECT` 指向的工程键一致时，会覆盖对应 SQLite / LanceDB / 日志路径；其它工程仍使用平台数据目录下按工程隔离的默认布局。
+
 tool 语义：
 
-- `index`
-  - 参数：`layer`
-  - 默认：`all`
+- `start_index`
+  - 参数：`layer`（可选）、`project`（可选）
+  - 默认：`layer = all`
+- `index_progress`
+  - 参数：`project`（可选）
+- `stop_index`
+  - 参数：`project`（可选）
 - `search`
-  - 参数：`query`、`layer`、`limit`、`threshold`、`paths`
+  - 参数：`query`、`layer`、`limit`、`threshold`、`paths`、`project`（除 `query` 外均可选）
   - 默认：`layer = symbol`、`limit = 10`、`threshold = 0.5`
 
 ## 核心约定
 
-- 首次进入仓库时，先执行 `index`
+- 首次进入仓库时，先执行 `start_index`（后台索引），并通过 `index_progress` 轮询进度
 - 索引完成后，再执行 `search`
 - 也支持在索引进行中执行 `search`，但只能返回当前已经写入索引的数据
 
@@ -109,9 +114,9 @@ semantic-search search ...
 
 两个命令共用以下核心参数：
 
-- `--project`：仓库根目录
-- `--index-db-path`：SQLite 元数据路径
-- `--vector-db-path`：LanceDB 路径
+- `--project`：仓库根目录（用于解析代码与 **默认** 存储路径；未显式指定 db/log 时，会落到「按工程隔离」目录，见上文）
+- `--index-db-path`：SQLite 元数据路径（可选；不设则用默认）
+- `--vector-db-path`：LanceDB 路径（可选；不设则用默认）
 - `--onnx-runtime-path`：ONNX Runtime 动态库路径（可选；不传则使用内置 `resources/`）
 - `--model-path`：embedding 模型路径（可选；不传则使用内置 `resources/`）
 - `--tokenizer-path`：tokenizer 路径（可选；不传则使用内置 `resources/`）
@@ -121,6 +126,7 @@ semantic-search search ...
 - `SEMANTIC_SEARCH_PROJECT`
 - `SEMANTIC_SEARCH_INDEX_DB`
 - `SEMANTIC_SEARCH_VECTOR_DB`
+- `SEMANTIC_SEARCH_LOG_PATH`
 - `SEMANTIC_SEARCH_ONNX_RUNTIME`（可选；用于覆盖内置 `resources/`）
 - `SEMANTIC_SEARCH_MODEL`（可选；用于覆盖内置 `resources/`）
 - `SEMANTIC_SEARCH_TOKENIZER`（可选；用于覆盖内置 `resources/`）

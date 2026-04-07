@@ -14,6 +14,7 @@ pub struct StorageOptions {
     pub vector_db_path: PathBuf,
 }
 
+/// Per-project storage: one SQLite file + one LanceDB directory for a single codebase.
 pub struct StorageManager {
     options: StorageOptions,
     pub index_status_store: IndexStatusStore,
@@ -44,39 +45,36 @@ impl StorageManager {
         Ok(project)
     }
 
-    pub fn update_project(&self, project_id: i64, index_finished_time: u64) -> anyhow::Result<()> {
+    /// 更新本库存储的工程元数据中的「索引完成时间」（单库至多一行）。
+    pub fn update_project_index_finished_time(
+        &self,
+        index_finished_time: u64,
+    ) -> anyhow::Result<()> {
         self.index_status_store
-            .update_project(project_id, index_finished_time)?;
+            .update_project_index_finished_time(index_finished_time)?;
         Ok(())
     }
 
-    pub fn get_project_index_finished_time(&self, project_id: i64) -> anyhow::Result<Option<u64>> {
+    pub fn get_project_index_finished_time(&self) -> anyhow::Result<Option<u64>> {
         let project_index_finished_time = self
             .index_status_store
-            .get_project_index_finished_time(project_id)?;
+            .get_project_index_finished_time()?;
         Ok(project_index_finished_time)
     }
 
-    pub fn get_index_status_by_project(
-        &self,
-        project_id: i64,
-        layer: IndexType,
-    ) -> anyhow::Result<Vec<IndexStatus>> {
-        let index_status = self
-            .index_status_store
-            .get_index_status_by_project(project_id, layer)?;
+    pub fn get_index_status_by_layer(&self, layer: IndexType) -> anyhow::Result<Vec<IndexStatus>> {
+        let index_status = self.index_status_store.get_index_status_by_layer(layer)?;
         Ok(index_status)
     }
 
     pub fn get_index_status(
         &self,
-        project_id: i64,
         file_path: &str,
         layer: IndexType,
     ) -> anyhow::Result<Option<IndexStatus>> {
         let index_status = self
             .index_status_store
-            .get_index_status_by_path(project_id, file_path, layer)?;
+            .get_index_status_by_path(file_path, layer)?;
         Ok(index_status)
     }
 
@@ -85,75 +83,55 @@ impl StorageManager {
         Ok(())
     }
 
-    pub fn delete_index_status_by_project(
-        &self,
-        project_id: i64,
-        layer: IndexType,
-    ) -> anyhow::Result<()> {
+    pub fn delete_index_status_by_layer(&self, layer: IndexType) -> anyhow::Result<()> {
         self.index_status_store
-            .delete_index_status_by_project(project_id, layer)?;
+            .delete_index_status_by_layer(layer)?;
         Ok(())
     }
 
     pub fn delete_index_status(
         &self,
-        project_id: i64,
         file_path: &str,
         layer: IndexType,
     ) -> anyhow::Result<()> {
         self.index_status_store
-            .delete_index_status_by_path(project_id, file_path, layer)?;
+            .delete_index_status_by_path(file_path, layer)?;
         Ok(())
     }
 
-    pub async fn get_or_create_chunk_table(
-        &self,
-        identifier: &str,
-        layer: IndexType,
-    ) -> anyhow::Result<Table> {
-        let table = self
-            .chunk_store
-            .get_or_create_table(identifier, layer)
-            .await?;
+    pub async fn get_or_create_chunk_table(&self, layer: IndexType) -> anyhow::Result<Table> {
+        let table = self.chunk_store.get_or_create_table(layer).await?;
         Ok(table)
     }
 
     pub async fn append_chunks(
         &self,
-        identifier: &str,
         layer: IndexType,
         chunks: Vec<Chunk>,
     ) -> anyhow::Result<()> {
-        self.chunk_store
-            .append_chunks(identifier, layer, chunks)
-            .await?;
+        self.chunk_store.append_chunks(layer, chunks).await?;
         Ok(())
     }
 
-    pub async fn delete_chunks_by_project(
-        &self,
-        identifier: &str,
-        layer: IndexType,
-    ) -> anyhow::Result<()> {
-        self.chunk_store.delete_table(identifier, layer).await?;
+    /// Drop the LanceDB table for this layer (this project DB only).
+    pub async fn delete_layer_table(&self, layer: IndexType) -> anyhow::Result<()> {
+        self.chunk_store.delete_table(layer).await?;
         Ok(())
     }
 
     pub async fn delete_chunks(
         &self,
-        identifier: &str,
         file_path: &str,
         layer: IndexType,
     ) -> anyhow::Result<()> {
         self.chunk_store
-            .delete_chunks_by_path(identifier, file_path, layer)
+            .delete_chunks_by_path(file_path, layer)
             .await?;
         Ok(())
     }
 
     pub async fn search(
         &self,
-        identifier: &str,
         query_vector: Vec<f32>,
         limit: usize,
         threshold: f32,
@@ -162,7 +140,7 @@ impl StorageManager {
     ) -> anyhow::Result<Vec<QueryResult>> {
         let results = self
             .chunk_store
-            .search(identifier, query_vector, limit, threshold, layer, paths)
+            .search(query_vector, limit, threshold, layer, paths)
             .await?;
         Ok(results)
     }

@@ -8,10 +8,11 @@ use crate::{
     embedding::utils::{EmbeddingOptions, OnnxRuntimeConfig},
     storage::manager::StorageOptions,
     tools::service::{
-        CommandHandler, IndexRequest, LayerSelector, ManagerBackend, ModelTypeArg, OutputFormat,
+        LayerSelector, ManagerBackend, ModelTypeArg, OutputFormat,
         ResolvedConfig, SearchRequest, validate_project_exists,
     },
 };
+use crate::tools::service::{dispatch_execute_index_progress, dispatch_execute_search, dispatch_execute_start_index, dispatch_execute_stop_index, CommandResponse, IndexProgressRequest, SemanticSearchBackend, StartIndexRequest, StopIndexRequest};
 
 #[derive(Debug, Parser)]
 #[command(name = "semantic-search")]
@@ -125,9 +126,11 @@ pub struct SearchCommand {
 }
 
 impl SharedArgs {
-    pub fn resolve(&self) -> anyhow::Result<ResolvedConfig> {
+    /// 解析（并创建）索引相关存储路径。该结果不放入 `ResolvedConfig`，避免把“工程状态”混进全局配置。
+    pub fn resolve_storage_options(&self) -> anyhow::Result<StorageOptions> {
         validate_project_exists(&self.project)?;
-        let default_paths = crate::resources::data_dir::platform_default_data_paths()?;
+        let default_paths =
+            crate::resources::project_paths::platform_project_default_paths(&self.project)?;
 
         let index_db_path = self
             .index_db_path
@@ -137,15 +140,25 @@ impl SharedArgs {
             .vector_db_path
             .clone()
             .unwrap_or_else(|| default_paths.vector_db_path.clone());
-        let log_path = self
-            .log_path
-            .clone()
-            .unwrap_or_else(|| default_paths.log_path.clone());
 
         if let Some(parent) = index_db_path.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::create_dir_all(&vector_db_path)?;
+
+        Ok(StorageOptions {
+            index_db_path,
+            vector_db_path,
+        })
+    }
+
+    pub fn resolve(&self) -> anyhow::Result<ResolvedConfig> {
+        validate_project_exists(&self.project)?;
+        let _storage_options = self.resolve_storage_options()?;
+        let log_path = match self.log_path.clone() {
+            Some(p) => p,
+            None => crate::resources::data_dir::platform_log_path()?,
+        };
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -174,11 +187,6 @@ impl SharedArgs {
         };
 
         Ok(ResolvedConfig {
-            project: self.project.clone(),
-            storage_options: StorageOptions {
-                index_db_path,
-                vector_db_path,
-            },
             onnx_runtime_config: OnnxRuntimeConfig {
                 runtime_path,
                 intra_threads: self.intra_threads,
@@ -193,6 +201,7 @@ impl SharedArgs {
                 num_threads: self.num_threads,
             },
             output: self.output,
+            log_path,
         })
     }
 }
@@ -201,10 +210,12 @@ pub async fn run_cli(cli: Cli) -> anyhow::Result<String> {
     match cli.command {
         Commands::Index(command) => {
             let config = command.shared.resolve()?;
-            let backend = ManagerBackend::new(&config).await?;
+            let storage_options = command.shared.resolve_storage_options()?;
+            let backend =
+                ManagerBackend::new(&command.shared.project, storage_options, &config).await?;
             let handler = CommandHandler::new(backend);
             let response = handler
-                .execute_index(IndexRequest {
+                .execute_start_index(StartIndexRequest {
                     project: command.shared.project.to_string_lossy().to_string(),
                     layer: command.layer,
                 })
@@ -213,7 +224,9 @@ pub async fn run_cli(cli: Cli) -> anyhow::Result<String> {
         }
         Commands::Search(command) => {
             let config = command.shared.resolve()?;
-            let backend = ManagerBackend::new(&config).await?;
+            let storage_options = command.shared.resolve_storage_options()?;
+            let backend =
+                ManagerBackend::new(&command.shared.project, storage_options, &config).await?;
             let handler = CommandHandler::new(backend);
             let response = handler
                 .execute_search(SearchRequest {
@@ -227,6 +240,41 @@ pub async fn run_cli(cli: Cli) -> anyhow::Result<String> {
                 .await?;
             response.render(config.output)
         }
+    }
+}
+
+
+pub struct CommandHandler<B> {
+    backend: B,
+}
+
+impl<B> CommandHandler<B> {
+    pub fn new(backend: B) -> Self {
+        Self { backend }
+    }
+}
+
+impl<B: SemanticSearchBackend> CommandHandler<B> {
+    pub async fn execute_start_index(
+        &self,
+        request: StartIndexRequest,
+    ) -> anyhow::Result<CommandResponse> {
+        dispatch_execute_start_index(&self.backend, request).await
+    }
+
+    pub async fn execute_index_progress(
+        &self,
+        request: IndexProgressRequest,
+    ) -> anyhow::Result<CommandResponse> {
+        dispatch_execute_index_progress(&self.backend, request).await
+    }
+
+    pub async fn execute_stop_index(&self, request: StopIndexRequest) -> anyhow::Result<CommandResponse> {
+        dispatch_execute_stop_index(&self.backend, request).await
+    }
+
+    pub async fn execute_search(&self, request: SearchRequest) -> anyhow::Result<CommandResponse> {
+        dispatch_execute_search(&self.backend, request).await
     }
 }
 
@@ -249,10 +297,6 @@ mod tests {
 
     #[async_trait]
     impl SemanticSearchBackend for MockBackend {
-        async fn index_layers(&self, _layers: &[IndexType]) -> anyhow::Result<IndexMetrics> {
-            Ok(self.metrics.clone())
-        }
-
         async fn start_indexing(
             &self,
             _layers: &[IndexType],
@@ -315,7 +359,6 @@ mod tests {
         let paths = data_dir::default_paths_under(&base);
         assert_eq!(paths.index_db_path, base.join("semantic_search/index.db"));
         assert_eq!(paths.vector_db_path, base.join("semantic_search/vectordb"));
-        assert_eq!(paths.log_path, base.join("semantic_search/running.log"));
     }
 
     #[test]
@@ -456,7 +499,7 @@ mod tests {
         let handler = CommandHandler::new(backend);
 
         let response = handler
-            .execute_index(IndexRequest {
+            .execute_start_index(StartIndexRequest {
                 project: shared_args().project.to_string_lossy().to_string(),
                 layer: LayerSelector::All,
             })
@@ -464,8 +507,6 @@ mod tests {
             .expect("execute index");
 
         let output = response.render(OutputFormat::Text).expect("render text");
-        assert!(output.contains("Index completed"));
-        assert!(output.contains("handled: 3 files, 8 symbols"));
-        assert!(output.contains("Run /search <query> after indexing"));
+        assert!(output.contains("Index started"));
     }
 }
