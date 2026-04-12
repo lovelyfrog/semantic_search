@@ -1,6 +1,16 @@
 # OpenCode 集成语义搜索
 
-本文档描述如何将 `semantic-search-mcp` 接入 **OpenCode**，包括：MCP server 配置、用户可用的 slash command、以及指导 agent 自动调用搜索能力的 skill 准则。
+本文档描述如何将语义搜索能力接入 **OpenCode**。提供三条集成路径
+
+| | 路径 A：Skill + CLI | 路径 B：Slash Command + MCP | 路径 C：Slash Command + MCP + Skill |
+|---|---|---|---|
+| 部署复杂度 | 只需 `semantic-search` binary | 需启动 `semantic-search-mcp` server | 需启动 MCP server + 安装 skill |
+| 索引方式 | 阻塞等待完成 | 后台非阻塞，可轮询进度 | 后台非阻塞，可轮询进度 |
+| 索引期间能否 search | 否（agent 被阻塞） | 能（返回部分结果） | 能（返回部分结果） |
+| 进度 / 取消 | 无 | slash command 显式控制 | slash command 显式控制 |
+| Agent search 行为 | skill 驱动（调 binary） | 依赖模型自身判断 + MCP instructions | skill 提供更明确的指导，行为更稳定 |
+| 额外上下文开销 | skill 文件 | 无 | skill 文件 |
+| 适用场景 | 轻量集成，不想维护 MCP server | 信任模型自身判断，不需要额外指导 | 需要可靠一致的 search 行为 + 用户手动控制 |
 
 ---
 
@@ -8,27 +18,70 @@
 
 ```mermaid
 flowchart LR
-  user[User] -->|slash command| agent[OpenCode Agent]
-  agent -->|MCP tool call| mcp[semantic-search-mcp\nstdio]
+  user[User]
 
-  subgraph mcpProc[MCP Server Process]
-    tools[Tools]
-    registry[ProjectRegistry]
-    backend[ManagerBackend]
-    tools --> registry --> backend
+  subgraph pathA[路径 A：Skill + CLI]
+    skillA[skill.md] -->|自动判断| agentA[Agent]
+    agentA -->|shell 调用\n阻塞| binary[semantic-search\nCLI binary]
   end
 
-  backend --> db[(index.db\nSQLite)]
-  backend --> vdb[(vectordb\nLanceDB)]
-  backend --> workers[IndexWorkers]
+  subgraph pathB[路径 B：Slash Command + MCP]
+    slashB[slash command] --> agentB[Agent]
+    agentB -->|MCP tool call| mcpB[semantic-search-mcp]
+  end
+
+  subgraph pathC[路径 C：Slash Command + MCP + Skill]
+    slashC[slash command] --> agentC[Agent]
+    skillC[skill.md] -->|自动判断| agentC
+    agentC -->|MCP tool call| mcpC[semantic-search-mcp]
+  end
+
+  user --> pathA
+  user --> pathB
+  user --> pathC
 ```
 
-- **Slash command**：提示词模板，用户输入命令后由 agent 执行对应的 MCP tool 调用。
-- **MCP server（stdio）**：承载索引与搜索的协议层，内部维护多工程 registry，支持在单个进程内同时服务多个仓库。
+- **路径 A**：部署最简单，但索引阻塞，期间无法 search。
+- **路径 B**：MCP 提供非阻塞索引与进度控制，agent 依赖模型自身能力和 MCP instructions 判断何时搜索。
+- **路径 C**：在路径 B 基础上加 skill，为 agent 提供更明确的行为指导（layer 选择、何时不该搜索等），行为更稳定，但增加上下文开销。
 
 ---
 
-## 1. 配置 MCP Server
+## 路径 A：Skill
+
+### 部署
+
+确保 `semantic-search` binary 在 agent 可执行的 PATH 中
+
+### 安装 Skill
+
+将 `skill/skill.md` 复制到目标仓库的 `.opencode/` 目录：
+
+```
+.opencode/
+└── skill.md
+```
+
+OpenCode 会自动将其加载为 agent 上下文。Skill 内容告知 agent：
+- 何时执行 `semantic-search search`（代码定位类问题时自动触发）
+- 首次使用或代码大幅变更后先执行 `semantic-search index --layer all`
+- 两个命令均为阻塞式，agent 等待命令完成即可，无需轮询
+
+### 路径 A 的弊端
+
+| 弊端 | 说明 |
+|------|------|
+| **索引期间无法 search** | `index` 阻塞 agent 当前执行线程，索引未完成前无法响应任何搜索请求 |
+| **无法获取部分结果** | MCP 路径下 `search` 可在索引进行中返回已写入的部分结果；CLI 路径下必须等索引全部完成 |
+| **每次调用重新加载模型** | 每个 `semantic-search` 进程独立加载 ONNX Runtime 和嵌入模型（数百 MB），频繁 search 时开销显著 |
+| **无进度反馈** | 大型仓库索引期间 agent 处于静默等待，无法向用户报告进度 |
+| **并发访问风险** | 若同时触发两个进程操作同一仓库数据（如后台 index + 前台 search），存在 SQLite 锁竞争风险 |
+
+---
+
+## 路径 B：Slash Command + MCP Server
+
+### 1. 配置 MCP Server
 
 在 OpenCode 配置文件中注册 `semantic-search` MCP server：
 
@@ -52,7 +105,7 @@ flowchart LR
 
 ---
 
-## 2. Slash Command 参考
+### 2. Slash Command 参考
 
 在目标仓库（被索引的 repo）中创建 `.opencode/commands/` 目录，并添加以下 Markdown 文件。文件名即命令名，frontmatter `description` 用于在 OpenCode 中展示命令说明，正文为 agent 执行该命令时的提示词模板。
 
@@ -108,79 +161,67 @@ flowchart LR
 
 ---
 
-## 3. Skill：Agent 行为准则
+## 路径 C：Slash Command + MCP Server + Skill
 
-本节定义 agent 在使用语义搜索能力时应遵循的决策规则。
+路径 C 在路径 B 的基础上加入 skill。**没有 skill，路径 B 的 agent 也可以调用 `search`**——MCP tool schema 和 `instructions` 字段已经提供了基本指导，有能力的模型会自行判断何时搜索。
 
-### 3.1 何时调用 `search`
+Skill 解决的不是"能不能搜"，而是**行为一致性**：
 
-满足以下任一条件时，agent 应优先调用 MCP `search`，而非直接阅读文件或全仓扫描：
+- **不加 skill**：agent 的搜索决策取决于模型能力和问题措辞，同一类问题可能触发也可能不触发
+- **加 skill**：明确告知 layer 如何选、哪些场景不该用语义搜索（应用 rg/grep），减少不必要的 tool 调用
 
-**定位类**
-- "X 在哪里实现 / 定义？"
-- "某接口 / 函数 / struct 在哪个文件里？"
+三者职责：
+- **Slash command**：用户手动控制索引生命周期（`/index`、`/index_progress`、`/stop_index`、`/index_last_update_time`）
+- **MCP server**：后台非阻塞索引 + 并发 search，执行层与路径 B 完全相同
+- **Skill**：补充 agent 行为指导，提升 search 决策的稳定性与质量
 
-**关系类**
-- "谁调用了 X？""X 会触发哪些逻辑？"
-- "这段逻辑和哪些模块相关？"
+### 安装 Skill
 
-**意图类（不知道精确关键词）**
-- "权限校验在哪里做的？"
-- "索引进度是怎么更新的？"
-
-**跨文件 / 跨模块**
-- 需要从多个位置快速收敛候选范围
-
-**不建议用语义搜索的情况：**
-- 查找字符串字面量在代码中的出现位置 → 用 `rg` / grep
-- 纯概念解释，不依赖代码细节
-
-### 3.2 `search` 默认参数建议
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `layer` | `symbol` | 定位定义 / 调用关系最稳定；问文档/注释用 `content`；要更广候选用 `all` |
-| `limit` | `10` | 通常足够；定位精确符号时可降至 5 |
-| `threshold` | `0.5` | 过低易噪音，过高易漏结果 |
-| `paths` | `[]` | 用户明确限定目录/模块时再传 |
-
-**层选择速查：**
-
-| 场景 | 推荐 `layer` |
-|------|-------------|
-| 定位函数/类/接口定义 | `symbol` |
-| 查找相关文件 | `file` |
-| 读文档/注释/README | `content` |
-| 需要全面候选集 | `all` |
-
-### 3.3 索引与搜索的协同策略
-
-**用户显式命令映射：**
-
-| 用户输入 | agent 调用 |
-|----------|-----------|
-| `/index` | `start_index(layer=all)` |
-| `/index_progress` | `index_progress` |
-| `/stop_index` | `stop_index` |
-| `/index_last_update_time` | `index_last_update_time` |
-
-**agent 主动行为：**
-
-- 执行 `search` 前**无需强制等待索引完成**，可直接调用。
-- `search` 内部会在上次索引完成超过 10 分钟时**自动触发后台刷新**（等价 `start_index(layer=all)`，非阻塞），并继续执行本次搜索。
-- 若索引正在进行中，返回结果可能不完整，回答时**需明确告知用户**。
-
-### 3.4 最小行为准则（可直接写入系统提示）
-
-```text
-当用户在问"代码在哪里/怎么实现/谁调用谁/相关模块有哪些"，优先调用 semantic-search MCP 的 search。
-search 会在索引超过 10min 时自动触发后台刷新；若索引正在进行中，结果可能不完整，需在回答中说明。
-当用户显式输入 /index、/index_progress、/stop_index、/index_last_update_time 时，分别调用对应的 MCP tool。
+```
+.opencode/
+├── skill.md                  ← agent 自动搜索行为准则（调用 MCP tools）
 ```
 
----
+> 注意：路径 C 的 skill 与路径 A 的 skill 内容不同——路径 A 的 skill 调 CLI binary，路径 C 的 skill 调 MCP tools。
 
-## 4. 运维注意事项
+### 路径 C 的 Skill 与 Slash Command 职责划分
+
+| 触发方式 | 处理方 | 说明 |
+|----------|--------|------|
+| 用户问"X 在哪里/怎么实现" | **Skill** 驱动 agent 自动调 MCP `search` | 无需用户显式输入命令 |
+| 用户输入 `/index` | **Slash command** 驱动 agent 调 `start_index` | 手动触发，立即返回 running |
+| 用户输入 `/index_progress` | **Slash command** 驱动 agent 调 `index_progress` | 查看进度 |
+| 用户输入 `/stop_index` | **Slash command** 驱动 agent 调 `stop_index` | 取消索引 |
+| 用户输入 `/index_last_update_time` | **Slash command** 驱动 agent 调 `index_last_update_time` | 查看更新时间 |
+
+### Agent 行为准则
+
+**何时主动调用 MCP `search`：**
+
+- **定位类**："X 在哪里实现/定义？""某接口/函数/struct 在哪个文件里？"
+- **关系类**："谁调用了 X？""X 会触发哪些逻辑？"
+- **意图类（不知道精确关键词）**："权限校验在哪里做的？""错误处理逻辑怎么运作？"
+- **跨文件/跨模块**：需要从多个位置快速收敛候选范围
+
+**不适合用语义搜索：**
+
+- 查找字符串字面量的出现位置 → 用 `rg` / grep
+- 纯概念解释、不依赖代码细节的问题
+
+**`search` 默认参数：**
+
+| 参数 | 默认值 | layer 选择建议 |
+|------|--------|--------------|
+| `layer` | `symbol` | 定义/调用关系用 `symbol`；找文件用 `file`；读文档/注释用 `content` |
+| `limit` | `10` | 精准定位可降至 5 |
+| `threshold` | `0.5` | 建议范围 0.4 ~ 0.8 |
+
+**索引与搜索协同：**
+
+- 执行 `search` 前无需强制等待索引完成，`search` 支持在索引进行中返回部分结果（需告知用户）
+- `search` 内部在上次索引完成超过 10 分钟时会自动触发后台刷新
+
+## 注意事项
 
 | 事项 | 说明 |
 |------|------|
@@ -192,7 +233,7 @@ search 会在索引超过 10min 时自动触发后台刷新；若索引正在进
 
 ---
 
-## 5. 交付物清单
+## 交付物清单
 
 ### commands
 
