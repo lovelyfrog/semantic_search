@@ -42,7 +42,7 @@ log4rs = { version = "1.3.0", features = ["all_components"] }
 
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 lancedb = { version = "0.19.1" }
-ort-sys = { version = "2.0.0-rc.9" }
+ort-sys = { version = "=2.0.0-rc.9" }
 arrow-array = { version = "54.2.1" }
 arrow-schema = { version = "54.2.1" }
 lsp-types = { version = "0.96.0", features = ["proposed"] }
