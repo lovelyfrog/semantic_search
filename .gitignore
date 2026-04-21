@@ -28,3 +28,6 @@ ehthumbs.db
 
 # resources
 resources/
+
+# build / release artifacts
+dist/

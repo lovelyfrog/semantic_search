@@ -25,6 +25,26 @@ cargo build --release
 cargo test
 ```
 
+## 打包与发布（`semantic-search-mcp` + `resources/`）
+
+本项目运行时会优先从“可执行文件同级的 `resources/`”加载模型与 onnxruntime，因此你可以把编译产物与 `resources/` 一起打包上传到 GitHub Release，解压即可用。
+
+- **macOS / Linux**（生成 `.tar.gz`）：
+
+```bash
+bash scripts/package-mcp.sh
+ls -lh dist/
+```
+
+- **Windows**（生成 `.zip`）：
+
+```powershell
+.\scripts\package-mcp.ps1
+dir .\dist
+```
+
+你也可以通过环境变量 **`SEMANTIC_SEARCH_RESOURCES_DIR`** 指定资源目录（优先级最高）。
+
 代码格式化（不依赖 [cargo-make](https://github.com/sagiegurari/cargo-make)）：
 
 ```bash
