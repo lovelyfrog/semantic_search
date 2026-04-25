@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use crate::common::data::{Chunk, IndexType};
 use crate::document_chunker::file::FileChunker;
 use crate::document_chunker::symbol::arkts::ArkTsChunker;
+use crate::document_chunker::symbol::cangjie::CangjieChunker;
 use crate::document_chunker::symbol::c::CChunker;
 use crate::document_chunker::symbol::cpp::CppChunker;
 use crate::document_chunker::symbol::ts::TsChunker;
@@ -52,12 +53,19 @@ impl ChunkerRegistry {
             );
         }
 
+        if let Ok(cj_chunker) = CangjieChunker::new() {
+            self.register(
+                ChunkerKey::Symbol(Language::Cangjie),
+                Arc::new(cj_chunker),
+            );
+
         if let Ok(c_chunker) = CChunker::new() {
             self.register(ChunkerKey::Symbol(Language::C), Arc::new(c_chunker));
         }
 
         if let Ok(cpp_chunker) = CppChunker::new() {
             self.register(ChunkerKey::Symbol(Language::Cpp), Arc::new(cpp_chunker));
+
         }
     }
 
